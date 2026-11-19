@@ -1,0 +1,521 @@
+"""Wake → beep → VAD → ASR state machine with meter/event fan-out."""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+import numpy as np
+import psutil
+
+from pawn_assistant.audio.beep import play_beep
+from pawn_assistant.audio.capture import AudioCapture, resample_mono
+from pawn_assistant.audio.debug_dump import DebugAudioDump
+from pawn_assistant.config import Settings
+from pawn_assistant.pipeline.asr import WhisperASR
+from pawn_assistant.pipeline.vad import SileroVAD
+from pawn_assistant.pipeline.wake import WakeDetector
+
+logger = logging.getLogger(__name__)
+
+EventCallback = Callable[[dict[str, Any]], None]
+
+
+class State(str, Enum):
+    IDLE = "IDLE"
+    STIR = "STIR"
+    AWAKE = "AWAKE"
+    LISTEN = "LISTEN"
+    HOLD = "HOLD"
+    BUSY = "BUSY"
+    FAULT = "FAULT"
+
+
+def _dbfs(samples: np.ndarray) -> tuple[float, float]:
+    if samples.size == 0:
+        return -120.0, -120.0
+    peak = float(np.max(np.abs(samples)))
+    rms = float(np.sqrt(np.mean(np.square(samples))))
+    peak_db = 20.0 * np.log10(peak) if peak > 1e-9 else -120.0
+    rms_db = 20.0 * np.log10(rms) if rms > 1e-9 else -120.0
+    return rms_db, peak_db
+
+
+class WakeLoop:
+    """Background audio pipeline that publishes meters and events."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        on_event: Optional[EventCallback] = None,
+        on_meter: Optional[EventCallback] = None,
+    ) -> None:
+        self.settings = settings
+        self.on_event = on_event or (lambda _e: None)
+        self.on_meter = on_meter or (lambda _m: None)
+
+        self.capture = AudioCapture(
+            sample_rate=settings.sample_rate,
+            frame_samples=settings.frame_samples,
+            device=settings.device,
+        )
+        self.wake = WakeDetector(settings.wake_model)
+        self.vad = SileroVAD(threshold=settings.vad_threshold)
+        self.asr = WhisperASR(
+            model_size=settings.whisper_model,
+            compute_type=settings.whisper_compute_type,
+            idle_unload_s=settings.whisper_idle_unload_s,
+            language=settings.asr_language,
+        )
+        self.debug: Optional[DebugAudioDump] = None
+        if settings.debug_audio_dir:
+            self.debug = DebugAudioDump(
+                Path(settings.debug_audio_dir),
+                sample_rate=settings.sample_rate,
+                preroll_s=settings.debug_preroll_s,
+            )
+
+        self._state = State.IDLE
+        self._state_since = time.monotonic()
+        self._thread: Optional[threading.Thread] = None
+        self._asr_thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._wake_mute_until = 0.0
+        self._wake_score = 0.0
+        self._vad_prob = 0.0
+        self._silence_ms = 0.0
+        self._heard_speech = False
+        self._speech_run_ms = 0.0
+        self._speech_total_ms = 0.0
+        self._listen_since = 0.0
+        self._utterance: list[np.ndarray] = []
+        self._last_rms = -120.0
+        self._last_peak = -120.0
+        self._last_frame_at = 0.0
+        self._last_near_miss_dump = 0.0
+        self._process = psutil.Process()
+        self._meter_interval = 1.0 / settings.meter_hz
+        self._next_meter = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def state(self) -> State:
+        return self._state
+
+    def snapshot_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "state": self._state.value,
+                "device_name": self.capture.device_info.name,
+                "sample_rate": self.settings.sample_rate,
+                "wake_model": self.settings.wake_model,
+                "wake_threshold": self.settings.wake_threshold,
+                "whisper_resident": self.asr.resident,
+                "overruns": self.capture.overruns,
+                "rss_mb": self._rss_mb(),
+                "debug_audio": str(self.debug.directory) if self.debug else None,
+            }
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        try:
+            self.wake.load()
+            self.vad.load()
+            self.capture.start()
+        except Exception as exc:  # noqa: BLE001
+            self._set_state(State.FAULT)
+            self._emit_event({"type": "event", "name": "fault", "message": str(exc)})
+            raise
+        self._last_frame_at = time.monotonic()
+        self._thread = threading.Thread(target=self._run, name="pawn-wake-loop", daemon=True)
+        self._thread.start()
+        logger.info(
+            "wake loop started device=%r model=%s threshold=%.2f debug=%s",
+            self.capture.device_info.name,
+            self.settings.wake_model,
+            self.settings.wake_threshold,
+            self.settings.debug_audio_dir,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+        if self._asr_thread and self._asr_thread.is_alive():
+            self._asr_thread.join(timeout=5.0)
+        self.capture.stop()
+
+    def _rss_mb(self) -> float:
+        try:
+            return self._process.memory_info().rss / (1024.0 * 1024.0)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def _set_state(self, state: State) -> None:
+        if state == self._state:
+            return
+        prev = self._state
+        self._state = state
+        self._state_since = time.monotonic()
+        logger.info("state %s → %s", prev.value, state.value)
+        self._emit_event(
+            {
+                "type": "event",
+                "name": "state",
+                "state": state.value,
+                "since_ms": 0,
+            }
+        )
+
+    def _emit_event(self, payload: dict[str, Any]) -> None:
+        try:
+            self.on_event(payload)
+        except Exception:  # noqa: BLE001
+            logger.exception("on_event failed")
+
+    def _emit_meter(self) -> None:
+        now = time.monotonic()
+        if now < self._next_meter:
+            return
+        self._next_meter = now + self._meter_interval
+        since_ms = int((now - self._state_since) * 1000)
+        payload = {
+            "type": "meter",
+            "rms_db": round(self._last_rms, 1),
+            "peak_db": round(self._last_peak, 1),
+            "wake_score": round(self._wake_score, 3),
+            "wake_threshold": self.settings.wake_threshold,
+            "vad_prob": round(self._vad_prob, 3),
+            "silence_ms": int(self._silence_ms),
+            "state": self._state.value,
+            "since_ms": since_ms,
+            "rss_mb": round(self._rss_mb(), 1),
+            "overruns": self.capture.overruns,
+            "queue_depth": self.capture.queue_depth,
+            "whisper_resident": self.asr.resident,
+            "device_name": self.capture.device_info.name,
+            "sample_rate": self.settings.sample_rate,
+            "stream_rate": self.capture.device_info.stream_rate,
+        }
+        try:
+            self.on_meter(payload)
+        except Exception:  # noqa: BLE001
+            logger.exception("on_meter failed")
+
+    def _is_speech_frame(self, frame: np.ndarray, *, allow_energy: bool = True) -> bool:
+        self._vad_prob = self.vad.prob(frame)
+        if self._vad_prob >= self.settings.vad_threshold:
+            return True
+        if not allow_energy:
+            return False
+        # Energy fallback only to *start* an utterance (Silero shy on hot mics).
+        # Do not use it to keep LISTEN open — room noise would never end the turn.
+        _rms, peak_db = _dbfs(frame)
+        return peak_db >= self.settings.energy_speech_db
+
+    def _return_to_idle(self, *, debounce_ms: Optional[float] = None) -> None:
+        self._utterance = []
+        self._silence_ms = 0.0
+        self._heard_speech = False
+        self._speech_run_ms = 0.0
+        self._speech_total_ms = 0.0
+        self._listen_since = 0.0
+        self._vad_prob = 0.0
+        self._wake_score = 0.0
+        self.capture.stop_utt_record()  # discard any in-flight native buffer
+        self.capture.drain()
+        self.wake.reset()
+        self.vad.reset()
+        wait = (
+            self.settings.wake_debounce_ms if debounce_ms is None else debounce_ms
+        )
+        self._wake_mute_until = time.monotonic() + (wait / 1000.0)
+        self._set_state(State.IDLE)
+
+    def _utt_audio_16k(self) -> np.ndarray:
+        """Prefer native-rate capture (no callback drops), resample once for ASR."""
+        native, native_rate = self.capture.stop_utt_record()
+        if native.size > 0:
+            audio = resample_mono(native, native_rate, self.settings.sample_rate)
+            if audio.size > 0:
+                return audio
+        if self._utterance:
+            return np.concatenate(self._utterance)
+        return np.zeros(0, dtype=np.float32)
+
+    def _run(self) -> None:
+        frame_ms = self.settings.frame_ms
+        while not self._stop.is_set():
+            frame = self.capture.read(timeout=0.5)
+            if frame is None:
+                if (
+                    self._last_frame_at
+                    and time.monotonic() - self._last_frame_at > 2.0
+                    and self._state not in (State.BUSY, State.FAULT)
+                ):
+                    logger.warning("no audio frames for 2s — restarting capture")
+                    try:
+                        self.capture.stop()
+                        self.capture.start()
+                        self._last_frame_at = time.monotonic()
+                        self.wake.reset()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("capture restart failed: %s", exc)
+                        self._set_state(State.FAULT)
+                        self._emit_event(
+                            {"type": "event", "name": "fault", "message": str(exc)}
+                        )
+                self._emit_meter()
+                continue
+            self._last_frame_at = time.monotonic()
+            if self.debug is not None:
+                self.debug.push(frame)
+            try:
+                self._handle_frame(frame, frame_ms)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("frame handler failed")
+                self._set_state(State.FAULT)
+                self._emit_event({"type": "event", "name": "fault", "message": str(exc)})
+                self._utterance.clear()
+                time.sleep(0.5)
+                self._return_to_idle()
+            self._emit_meter()
+
+    def _handle_frame(self, frame: np.ndarray, frame_ms: float) -> None:
+        self._last_rms, self._last_peak = _dbfs(frame)
+        muted = time.monotonic() < self._wake_mute_until
+
+        if self._state == State.BUSY:
+            self._wake_score = 0.0
+            return
+
+        if self._state in (State.IDLE, State.STIR):
+            if muted:
+                self._wake_score = 0.0
+            else:
+                self._wake_score = self.wake.score(frame)
+                self._maybe_dump_near_miss()
+            if self._wake_score >= self.settings.wake_threshold:
+                self._on_wake()
+            elif self._wake_score >= self.settings.stir_threshold:
+                self._set_state(State.STIR)
+            else:
+                self._set_state(State.IDLE)
+            return
+
+        if self._state == State.AWAKE:
+            self._set_state(State.LISTEN)
+            self.vad.reset()
+            self._utterance = [frame]
+            self._silence_ms = 0.0
+            self._speech_run_ms = 0.0
+            self._speech_total_ms = 0.0
+            self._heard_speech = False
+            self._listen_since = time.monotonic()
+            return
+
+        if self._state in (State.LISTEN, State.HOLD):
+            armed = (
+                time.monotonic() - self._listen_since
+                >= self.settings.post_wake_arm_ms / 1000.0
+            )
+            # Before arm: Silero only (skip energy — wake-word echo is loud).
+            # After speech latched: VAD-only so room noise cannot prolong the turn.
+            allow_energy = armed and not self._heard_speech
+            speech = self._is_speech_frame(frame, allow_energy=allow_energy)
+            if not armed:
+                # Still fill VAD meters, but never latch speech on the wake tail.
+                speech = False
+            self._utterance.append(frame)
+            utterance_ms = len(self._utterance) * frame_ms
+
+            if speech:
+                self._speech_run_ms += frame_ms
+                self._silence_ms = 0.0
+                if (
+                    not self._heard_speech
+                    and self._speech_run_ms >= self.settings.speech_start_ms
+                ):
+                    self._heard_speech = True
+                    logger.info(
+                        "speech start after %.0f ms listen",
+                        utterance_ms,
+                    )
+                if self._heard_speech:
+                    self._speech_total_ms += frame_ms
+                    self._set_state(State.LISTEN)
+            elif self._heard_speech:
+                self._speech_run_ms = 0.0
+                self._silence_ms += frame_ms
+                self._set_state(State.HOLD)
+            else:
+                self._speech_run_ms = 0.0
+                self._silence_ms = 0.0
+                self._set_state(State.LISTEN)
+
+            if not self._heard_speech and utterance_ms >= self.settings.speech_wait_ms:
+                logger.info("no speech after wake — back to idle")
+                if self.debug is not None:
+                    audio = self._utt_audio_16k()
+                    self.debug.save(
+                        "empty_utt",
+                        audio,
+                        meta=(
+                            f"reason=no_speech_wait vad={self._vad_prob:.3f} "
+                            f"peak_db={self._last_peak:.1f} "
+                            f"overruns={self.capture.overruns}"
+                        ),
+                    )
+                    self.debug.save(
+                        "empty_preroll",
+                        meta=f"reason=no_speech_wait score_at_wake see wake_*.wav",
+                    )
+                self._emit_event(
+                    {
+                        "type": "event",
+                        "name": "transcript",
+                        "text": "",
+                        "duration_ms": 0,
+                        "infer_ms": 0,
+                        "rtf": 0,
+                        "reason": "no_speech",
+                    }
+                )
+                self._return_to_idle()
+                return
+
+            can_end = (
+                self._heard_speech
+                and self._speech_total_ms >= self.settings.min_speech_ms
+                and self._silence_ms >= self.settings.silence_end_ms
+            )
+            if can_end or utterance_ms >= self.settings.max_utterance_ms:
+                self._begin_transcribe()
+            return
+
+        self._wake_score = 0.0
+
+    def _maybe_dump_near_miss(self) -> None:
+        if self.debug is None:
+            return
+        thr = self.settings.debug_wake_score_dump
+        if self._wake_score < thr:
+            return
+        now = time.monotonic()
+        if now - self._last_near_miss_dump < 2.0:
+            return
+        self._last_near_miss_dump = now
+        self.debug.save(
+            f"near_miss_{self._wake_score:.2f}",
+            meta=(
+                f"wake_score={self._wake_score:.3f} "
+                f"threshold={self.settings.wake_threshold}"
+            ),
+        )
+
+    def _on_wake(self) -> None:
+        logger.info("wake detected score=%.3f", self._wake_score)
+        if self.debug is not None:
+            self.debug.save(
+                f"wake_{self._wake_score:.2f}",
+                meta=(
+                    f"wake_score={self._wake_score:.3f} "
+                    f"threshold={self.settings.wake_threshold} "
+                    f"device={self.capture.device_info.name}"
+                ),
+            )
+        self._set_state(State.AWAKE)
+        self._emit_event({"type": "event", "name": "beep"})
+        play_beep(
+            sample_rate=self.settings.sample_rate,
+            freq_hz=self.settings.beep_freq_hz,
+            duration_ms=self.settings.beep_duration_ms,
+            volume=self.settings.beep_volume,
+        )
+        self._wake_mute_until = time.monotonic() + (
+            self.settings.beep_mute_ms / 1000.0
+        )
+        self.wake.reset()
+        self._utterance = []
+        self._silence_ms = 0.0
+        self._speech_run_ms = 0.0
+        self._speech_total_ms = 0.0
+        self._heard_speech = False
+        self._vad_prob = 0.0
+        # Drop wake-word audio still sitting in the convert queue so it cannot
+        # latch "heard speech" and burn the silence budget before you talk.
+        self.capture.drain()
+        self.capture.start_utt_record()
+
+    def _begin_transcribe(self) -> None:
+        audio = self._utt_audio_16k()
+        self._utterance = []
+        self._silence_ms = 0.0
+        self._set_state(State.BUSY)
+
+        trim = int(
+            self.settings.sample_rate * (self.settings.silence_end_ms / 1000.0) * 0.5
+        )
+        if trim > 0 and audio.size > trim:
+            audio = audio[:-trim]
+
+        dur_s = audio.size / float(self.settings.sample_rate) if audio.size else 0.0
+        if self.debug is not None:
+            self.debug.save(
+                "utt",
+                audio,
+                meta=(
+                    f"samples={audio.size} dur_s={dur_s:.2f} "
+                    f"peak={float(np.max(np.abs(audio))) if audio.size else 0:.3f} "
+                    f"overruns={self.capture.overruns} "
+                    f"stream_rate={self.capture.device_info.stream_rate}"
+                ),
+            )
+
+        def _worker() -> None:
+            try:
+                if audio.size < self.settings.sample_rate * 0.15:
+                    self._emit_event(
+                        {
+                            "type": "event",
+                            "name": "transcript",
+                            "text": "",
+                            "duration_ms": 0,
+                            "infer_ms": 0,
+                            "rtf": 0,
+                            "reason": "too_short",
+                        }
+                    )
+                else:
+                    result = self.asr.transcribe(
+                        audio, sample_rate=self.settings.sample_rate
+                    )
+                    self._emit_event(
+                        {
+                            "type": "event",
+                            "name": "transcript",
+                            "text": result.text,
+                            "duration_ms": round(result.duration_ms, 1),
+                            "infer_ms": round(result.infer_ms, 1),
+                            "rtf": round(result.rtf, 3),
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("ASR failed")
+                self._emit_event(
+                    {"type": "event", "name": "fault", "message": f"ASR: {exc}"}
+                )
+            finally:
+                self._return_to_idle()
+
+        self._asr_thread = threading.Thread(
+            target=_worker, name="pawn-asr", daemon=True
+        )
+        self._asr_thread.start()

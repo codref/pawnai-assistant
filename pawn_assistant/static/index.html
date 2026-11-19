@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PAWN</title>
+  <link rel="stylesheet" href="/static/css/hud.css" />
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
+</head>
+<body>
+  <div class="scanlines" aria-hidden="true"></div>
+  <div class="frame">
+    <header class="mast">
+      <h1 class="brand">PAWN</h1>
+      <p class="tag">wake loop · point 1</p>
+      <div id="state-chip" class="chip" data-state="IDLE">IDLE</div>
+    </header>
+
+    <main class="stage">
+      <div id="presence" class="presence"></div>
+    </main>
+
+    <aside class="dock" id="dock">
+      <section class="panel">
+        <h2>signal</h2>
+        <dl>
+          <dt>device</dt><dd id="d-device">—</dd>
+          <dt>rate</dt><dd id="d-rate">—</dd>
+          <dt>overruns</dt><dd id="d-overruns">0</dd>
+          <dt>rms</dt><dd id="d-rms">—</dd>
+          <dt>peak</dt><dd id="d-peak">—</dd>
+        </dl>
+        <div class="bar-wrap" title="RMS">
+          <div id="bar-rms" class="bar"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>wake</h2>
+        <dl>
+          <dt>model</dt><dd id="d-wake-model">—</dd>
+          <dt>score</dt><dd id="d-wake-score">0.000</dd>
+          <dt>threshold</dt><dd id="d-wake-thr">0.500</dd>
+        </dl>
+        <canvas id="wake-spark" width="280" height="48" aria-label="wake score sparkline"></canvas>
+      </section>
+
+      <section class="panel">
+        <h2>utterance</h2>
+        <dl>
+          <dt>vad</dt><dd id="d-vad">0.000</dd>
+          <dt>silence</dt><dd id="d-silence">0 ms</dd>
+          <dt>state dwell</dt><dd id="d-dwell">0 ms</dd>
+          <dt>whisper</dt><dd id="d-whisper">cold</dd>
+          <dt>last dur</dt><dd id="d-last-dur">—</dd>
+          <dt>infer</dt><dd id="d-infer">—</dd>
+          <dt>rtf</dt><dd id="d-rtf">—</dd>
+          <dt>rss</dt><dd id="d-rss">—</dd>
+        </dl>
+      </section>
+
+      <section class="panel panel-log">
+        <h2>transcript</h2>
+        <ol id="transcript-log" class="log"></ol>
+      </section>
+    </aside>
+  </div>
+
+  <script src="/static/js/presence.js"></script>
+  <script src="/static/js/main.js"></script>
+</body>
+</html>

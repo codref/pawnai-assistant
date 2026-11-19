@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+pawn_assistant.egg-info/
+dist/
+build/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+*.flac
+*.wav
+debug-audio/
+wakewords/
+pawn-assistant.yaml
+.pawn-assistant.yaml
+.DS_Store

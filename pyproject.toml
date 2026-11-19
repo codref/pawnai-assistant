@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pawn-assistant"
+version = "0.1.0"
+description = "Always-listening Pawn wake loop and cyberpunk HUD"
+readme = "README.md"
+# openwakeword → tflite-runtime has no cp312 wheels; use 3.11.
+requires-python = ">=3.11,<3.12"
+license = { text = "MIT" }
+authors = [{ name = "PawnAI" }]
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0",
+    "onnxruntime>=1.16.0",
+    "openwakeword>=0.6.0",
+    "faster-whisper>=1.0.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+    "psutil>=5.9.0",
+    "pydantic>=2.0.0",
+    "PyYAML>=6.0",
+    "scipy>=1.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+]
+# Prefer the CPU wheel on this laptop (avoids multi‑GB CUDA deps):
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   uv sync --extra wake-train
+wake-train = [
+    "scipy>=1.10.0",
+    "onnx>=1.15.0",
+]
+
+[project.scripts]
+pawn-assistant = "pawn_assistant.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["pawn_assistant*"]
+
+[tool.setuptools.package-data]
+pawn_assistant = ["static/**/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
