@@ -1,4 +1,4 @@
-"""CLI entry: pawn-assistant serve | list-devices | probe | monitor."""
+"""CLI entry: pawn-assistant serve | ask | say | models | list-devices | probe | monitor."""
 
 from __future__ import annotations
 
@@ -262,6 +262,471 @@ def serve(
     )
 
 
+def _command_settings(config: Optional[str]):
+    from pawn_assistant.config import load_settings
+
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    return load_settings(config)
+
+
+def _build_router(settings, *, use_llm: bool = True):
+    from pawn_assistant.commands import CommandContext, CommandRouter
+    from pawn_assistant.commands.llm import IntentLLM
+
+    llm = None
+    if use_llm and settings.intent_enabled:
+        llm = IntentLLM(
+            model=settings.intent_model,
+            n_threads=settings.intent_threads,
+            idle_unload_s=0,
+        )
+    return CommandRouter(
+        ctx=CommandContext(lang=settings.reply_language),
+        llm=llm,
+        fastpath_ratio=settings.intent_fastpath_ratio,
+    )
+
+
+def _run_eval(router, path: Path) -> None:
+    import yaml
+
+    cases = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    table = Table(title=f"intent eval — {path.name}")
+    for col in ("utterance", "expected", "got", "via", "ms", ""):
+        table.add_column(col)
+    ok = 0
+    llm_ms: list[float] = []
+    for case in cases:
+        text, want = case["text"], case["intent"]
+        want_slots = case.get("slots") or {}
+        res = router.classify(text)
+        good = res.intent == want and res.slots == want_slots
+        ok += good
+        if res.source == "llm":
+            llm_ms.append(res.parse_ms)
+        got = res.intent + (f" {res.slots}" if res.slots else "")
+        table.add_row(
+            text, want + (f" {want_slots}" if want_slots else ""), got, res.source,
+            f"{res.parse_ms:.0f}", "[green]✓[/]" if good else "[red]✗[/]",
+        )
+    router.ctx.timers.cancel_all()
+    console.print(table)
+    console.print(f"[bold]accuracy[/] {ok}/{len(cases)} = {100.0 * ok / max(1, len(cases)):.1f}%")
+    if llm_ms:
+        arr = np.array(llm_ms)
+        console.print(
+            f"[bold]llm[/] n={arr.size} p50={np.percentile(arr, 50):.0f} ms "
+            f"p95={np.percentile(arr, 95):.0f} ms max={arr.max():.0f} ms"
+        )
+
+
+def _phrase_samples(llm, settings, res, text: str, samples: int) -> str:
+    """Print ``samples`` phrased variants with timings; return the first."""
+    from pawn_assistant.commands.phrasing import PhraseSettings, ReplyPhraser
+
+    phraser = ReplyPhraser(llm, PhraseSettings.from_settings(settings))
+    if not phraser.applies(res.intent):
+        console.print(f"[bold green]PAWN:[/] {res.reply}  [dim](phrasing off for {res.intent})[/]")
+        return res.reply
+    with console.status("warming up LLM prompts…"):
+        llm.load()
+        phraser.warmup()
+    console.print(f"[dim]canonical:[/] {res.reply}")
+    first_ms: list[float] = []
+    fallbacks = 0
+    first_reply = ""
+    for _ in range(samples):
+        out, stats = phraser.phrase(res.intent, text, res.reply)
+        first_reply = first_reply or out
+        if stats.phrased:
+            first_ms.append(stats.first_ms)
+            note = f"first {stats.first_ms:.0f} ms · total {stats.gen_ms:.0f} ms"
+            if stats.reason:
+                note += f" · {stats.reason}"
+            console.print(f"[bold green]PAWN:[/] {out}  [dim]{note}[/]")
+        else:
+            fallbacks += 1
+            console.print(f"[bold yellow]PAWN:[/] {out}  [dim]fallback · {stats.reason}[/]")
+    if samples > 1:
+        line = f"[bold]phrased[/] {samples - fallbacks}/{samples}"
+        if first_ms:
+            arr = np.array(first_ms)
+            line += (
+                f" · first sentence p50={np.percentile(arr, 50):.0f} ms "
+                f"p95={np.percentile(arr, 95):.0f} ms"
+            )
+        console.print(line)
+    return first_reply
+
+
+@app.command("ask")
+def ask(
+    text: Optional[str] = typer.Argument(None, help="Command text, e.g. \"che ora è\""),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="YAML config"),
+    speak: bool = typer.Option(True, "--speak/--no-speak", help="Say the reply with Piper"),
+    no_llm: bool = typer.Option(False, "--no-llm", help="Fast-path only"),
+    eval_file: Optional[Path] = typer.Option(
+        None, "--eval", help="YAML list of {text, intent, slots?} — prints accuracy/latency"
+    ),
+    phrase: Optional[bool] = typer.Option(
+        None, "--phrase/--no-phrase", help="Reword the reply with the LLM (default: config)"
+    ),
+    samples: int = typer.Option(1, "--samples", "-n", help="Phrased variants to generate"),
+) -> None:
+    """Route a typed command through fast-path → LLM → handler (no mic)."""
+    settings = _command_settings(config)
+    router = _build_router(settings, use_llm=not no_llm)
+    if eval_file is not None:
+        if router.llm is not None:
+            with console.status("warming up intent LLM…"):
+                router.llm.warmup()
+        _run_eval(router, eval_file)
+        return
+    if not text:
+        console.print("[red]give a command text or --eval FILE[/]")
+        raise typer.Exit(2)
+    res = router.handle(text)
+    console.print(
+        f"[magenta]{res.intent}[/] {res.slots or ''} "
+        f"[dim]via {res.source} · {res.parse_ms:.0f} ms[/]"
+    )
+    reply = res.reply
+    use_phrase = settings.phrase_enabled if phrase is None else phrase
+    if use_phrase and router.llm is not None and res.reply:
+        reply = _phrase_samples(router.llm, settings, res, text, max(1, samples))
+    else:
+        console.print(f"[bold green]PAWN:[/] {res.reply}")
+    if speak and settings.tts_enabled and reply:
+        from pawn_assistant.audio.tts import PiperTTS
+
+        tts = PiperTTS(
+            voice=settings.tts_voice,
+            length_scale=settings.tts_length_scale,
+            volume=settings.tts_volume,
+            idle_unload_s=0,
+            speaker_id=settings.tts_speaker_id,
+        )
+        speech = tts.speak(reply)
+        console.print(f"[dim]tts {speech.synth_ms:.0f} ms for {speech.duration_ms:.0f} ms audio[/]")
+    if router.ctx.timers.active:
+        console.print("[dim]timer started — it only fires while `serve` is running[/]")
+        router.ctx.timers.cancel_all()
+
+
+@app.command("say")
+def say(
+    text: str = typer.Argument(..., help="Text to speak"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="YAML config"),
+    voice: Optional[str] = typer.Option(None, help="Piper voice id or .onnx path"),
+) -> None:
+    """Speak text with the configured Piper voice."""
+    from pawn_assistant.audio.tts import PiperTTS
+
+    settings = _command_settings(config)
+    tts = PiperTTS(
+        voice=voice or settings.tts_voice,
+        length_scale=settings.tts_length_scale,
+        volume=settings.tts_volume,
+        idle_unload_s=0,
+        speaker_id=settings.tts_speaker_id,
+    )
+    speech = tts.speak(text)
+    console.print(
+        f"[dim]{tts.voice}: synth {speech.synth_ms:.0f} ms for {speech.duration_ms:.0f} ms "
+        f"audio (rtf {speech.synth_ms / max(1.0, speech.duration_ms):.2f})[/]"
+    )
+
+
+voice_app = typer.Typer(
+    name="voice", help="Choose, audition and configure the Piper voice.", no_args_is_help=True
+)
+app.add_typer(voice_app, name="voice")
+
+_CONFIG_OPT = typer.Option(None, "--config", "-c", help="YAML config")
+
+
+def _make_tts(settings, voice: str, speed: Optional[float], volume: Optional[float],
+              speaker: Optional[int]):
+    from pawn_assistant.audio.tts import PiperTTS
+
+    return PiperTTS(
+        voice=voice,
+        length_scale=speed if speed is not None else settings.tts_length_scale,
+        volume=volume if volume is not None else settings.tts_volume,
+        idle_unload_s=0,
+        speaker_id=speaker if speaker is not None else settings.tts_speaker_id,
+    )
+
+
+def _audition(tts, text: str) -> bool:
+    """Speak ``text``; print timings. Returns False when the voice failed to load."""
+    try:
+        with console.status(f"loading {tts.voice}…"):
+            tts.load()
+        speech = tts.speak(text)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{tts.voice}: {exc}[/]")
+        return False
+    console.print(
+        f"[dim]synth {speech.synth_ms:.0f} ms · audio {speech.duration_ms:.0f} ms · "
+        f"rtf {speech.synth_ms / max(1.0, speech.duration_ms):.2f}[/]"
+    )
+    return True
+
+
+def _default_lang(settings, lang: Optional[str]) -> str:
+    return lang or settings.reply_language or "en"
+
+
+@voice_app.command("current")
+def voice_current(config: Optional[str] = _CONFIG_OPT) -> None:
+    """Show the configured voice and its settings."""
+    from pawn_assistant.audio.voices import is_installed
+
+    s = _command_settings(config)
+    console.print(f"voice      [bold cyan]{s.tts_voice}[/]")
+    console.print(f"downloaded {'yes' if is_installed(s.tts_voice) or s.tts_voice.endswith('.onnx') else 'no'}")
+    console.print(
+        f"speed      {s.tts_length_scale} (length_scale; >1 slower)\n"
+        f"volume     {s.tts_volume}\n"
+        f"speaker_id {s.tts_speaker_id}\n"
+        f"config     {s.config_path or '[yellow]none found[/]'}"
+    )
+
+
+@voice_app.command("list")
+def voice_list(
+    lang: Optional[str] = typer.Option(
+        None, "--lang", "-l", help="Language/locale prefix (it, en_GB…). Default: reply_language"
+    ),
+    all_langs: bool = typer.Option(False, "--all", help="Do not filter by language"),
+    quality: Optional[str] = typer.Option(None, "--quality", "-q", help="x_low|low|medium|high"),
+    installed: bool = typer.Option(False, "--installed", help="Only downloaded voices"),
+    config: Optional[str] = _CONFIG_OPT,
+) -> None:
+    """List Piper voices from the rhasspy/piper-voices catalog."""
+    from pawn_assistant.audio.voices import filter_voices, load_catalog
+
+    settings = _command_settings(config)
+    with console.status("loading voice catalog…"):
+        voices, online = load_catalog()
+    if not online:
+        console.print("[yellow]Catalog unreachable — showing locally cached voices only.[/]")
+    shown = filter_voices(
+        voices,
+        lang=None if all_langs else _default_lang(settings, lang),
+        quality=quality,
+        installed=installed,
+    )
+    table = Table(title=f"Piper voices ({len(shown)})")
+    for col, just in (("id", "left"), ("locale", "left"), ("quality", "left"),
+                      ("spk", "right"), ("rate", "right"), ("size", "right"), ("", "left")):
+        table.add_column(col, justify=just, no_wrap=True)
+    for v in shown:
+        mark = "[green]✓ installed[/]" if v.installed else ""
+        if v.id == settings.tts_voice:
+            mark += " [bold cyan]← current[/]"
+        table.add_row(
+            v.id, v.locale, v.quality, str(v.speakers), str(v.sample_rate),
+            f"{v.size_mb:.0f} MB" if v.size_mb else "—", mark,
+        )
+    console.print(table)
+    console.print(
+        "Audition: [cyan]pawn-assistant voice test ID [ID…][/]   "
+        "Interactive: [cyan]pawn-assistant voice pick[/]"
+    )
+
+
+@voice_app.command("test")
+def voice_test(
+    voices: Optional[list[str]] = typer.Argument(
+        None, help="Voice ids / .onnx paths (default: the configured voice)"
+    ),
+    text: Optional[str] = typer.Option(None, "--text", "-t", help="Sentence to speak"),
+    long: bool = typer.Option(False, "--long", help="Use the longer built-in sentence"),
+    lang: Optional[str] = typer.Option(
+        None, "--lang", "-l", help="With --all: audition every voice of this language"
+    ),
+    all_voices: bool = typer.Option(False, "--all", help="Audition every voice for --lang"),
+    quality: Optional[str] = typer.Option(None, "--quality", "-q"),
+    speed: Optional[float] = typer.Option(None, "--speed", help="length_scale (>1 slower)"),
+    volume: Optional[float] = typer.Option(None, "--volume"),
+    speaker: Optional[int] = typer.Option(None, "--speaker", help="Speaker id (multi-speaker)"),
+    config: Optional[str] = _CONFIG_OPT,
+) -> None:
+    """Speak the same sentence with one or more voices for A/B comparison."""
+    from pawn_assistant.audio.voices import filter_voices, load_catalog, sample_text
+
+    settings = _command_settings(config)
+    ids = list(voices or [])
+    if all_voices:
+        cat, _ = load_catalog()
+        ids += [v.id for v in filter_voices(cat, lang=_default_lang(settings, lang), quality=quality)]
+    if not ids:
+        ids = [settings.tts_voice]
+    phrase = text or sample_text(_default_lang(settings, lang), long=long)
+    console.print(f"[dim]“{phrase}”[/]")
+    failed = 0
+    for vid in ids:
+        mark = " [bold cyan](current)[/]" if vid == settings.tts_voice else ""
+        console.print(f"[bold]{vid}[/]{mark}")
+        if not _audition(_make_tts(settings, vid, speed, volume, speaker), phrase):
+            failed += 1
+    if failed:
+        raise typer.Exit(1)
+    if len(ids) > 1:
+        console.print("Keep one with: [cyan]pawn-assistant voice use ID[/]")
+
+
+def _getkey() -> str:
+    import sys
+
+    if not sys.stdin.isatty():
+        return (sys.stdin.readline() or "q")[:1].lower() or "q"
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        return sys.stdin.read(1).lower()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+@voice_app.command("pick")
+def voice_pick(
+    lang: Optional[str] = typer.Option(None, "--lang", "-l"),
+    quality: Optional[str] = typer.Option(None, "--quality", "-q"),
+    installed: bool = typer.Option(False, "--installed", help="Only already-downloaded voices"),
+    text: Optional[str] = typer.Option(None, "--text", "-t"),
+    config: Optional[str] = _CONFIG_OPT,
+) -> None:
+    """Browse voices interactively: n/p next/prev, r replay, +/- speed, enter=keep, q=quit."""
+    from pawn_assistant.audio.voices import filter_voices, load_catalog, sample_text
+
+    settings = _command_settings(config)
+    use_lang = _default_lang(settings, lang)
+    with console.status("loading voice catalog…"):
+        cat, _ = load_catalog()
+    pool = filter_voices(cat, lang=use_lang, quality=quality, installed=installed)
+    if not pool:
+        console.print(f"[red]No voices match lang={use_lang!r}.[/]")
+        raise typer.Exit(1)
+    phrase = text or sample_text(use_lang)
+    idx = next((i for i, v in enumerate(pool) if v.id == settings.tts_voice), 0)
+    speed = settings.tts_length_scale
+    speaker: Optional[int] = settings.tts_speaker_id
+    play = True
+    while True:
+        v = pool[idx]
+        console.print(
+            f"\n[bold cyan]{v.id}[/]  ({idx + 1}/{len(pool)})  speed {speed:.2f}"
+            + (f"  speaker {speaker}" if v.speakers > 1 else "")
+        )
+        if play:
+            _audition(_make_tts(settings, v.id, speed, None, speaker if v.speakers > 1 else None), phrase)
+        play = True
+        console.print("[dim]n/p next/prev · r replay · +/- speed · s speaker · enter keep · q quit[/]")
+        key = _getkey()
+        if key in ("n", " ", "\x1b"):
+            idx = (idx + 1) % len(pool)
+        elif key == "p":
+            idx = (idx - 1) % len(pool)
+        elif key == "r":
+            pass
+        elif key == "+":
+            speed = max(0.5, round(speed - 0.05, 2))  # faster = smaller length_scale
+        elif key == "-":
+            speed = min(2.0, round(speed + 0.05, 2))
+        elif key == "s" and v.speakers > 1:
+            speaker = ((speaker or 0) + 1) % v.speakers
+        elif key in ("\n", "\r"):
+            _save_voice(settings, v.id, speed, speaker if v.speakers > 1 else None, yes=False)
+            return
+        elif key == "q":
+            console.print("no change")
+            return
+        else:
+            play = False
+
+
+def _save_voice(settings, voice: str, speed: Optional[float], speaker: Optional[int],
+                *, yes: bool, volume: Optional[float] = None, path: Optional[str] = None) -> None:
+    from pawn_assistant.audio.voices import update_yaml_section
+
+    target = Path(path) if path else (Path(settings.config_path) if settings.config_path else None)
+    values: dict = {"voice": voice}
+    if speed is not None:
+        values["length_scale"] = speed
+    if volume is not None:
+        values["volume"] = volume
+    if speaker is not None:
+        values["speaker_id"] = speaker
+    if target is None:
+        console.print(
+            "[yellow]No config file found.[/] Add to your YAML:\n"
+            + "tts:\n" + "".join(f"  {k}: {v}\n" for k, v in values.items())
+        )
+        return
+    if not yes and not typer.confirm(f"Write {values} to {target}?", default=True):
+        console.print("no change")
+        return
+    update_yaml_section(target, "tts", values)
+    console.print(f"[green]saved[/] tts.voice = [bold]{voice}[/] → {target}")
+
+
+@voice_app.command("use")
+def voice_use(
+    voice: str = typer.Argument(..., help="Piper voice id or .onnx path"),
+    speed: Optional[float] = typer.Option(None, "--speed", help="length_scale (>1 slower)"),
+    volume: Optional[float] = typer.Option(None, "--volume"),
+    speaker: Optional[int] = typer.Option(None, "--speaker"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask before writing"),
+    no_check: bool = typer.Option(False, "--no-check", help="Skip download/load validation"),
+    config: Optional[str] = _CONFIG_OPT,
+) -> None:
+    """Validate a voice (downloads it) and write it into the YAML config in place."""
+    settings = _command_settings(config)
+    if not no_check:
+        tts = _make_tts(settings, voice, speed, volume, speaker)
+        try:
+            with console.status(f"downloading/loading {voice}…"):
+                tts.load()
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Cannot use {voice}:[/] {exc}")
+            raise typer.Exit(1) from exc
+    _save_voice(settings, voice, speed, speaker, yes=yes, volume=volume)
+    console.print("Restart [cyan]serve[/] to pick it up. Check with: [cyan]pawn-assistant say \"ciao\"[/]")
+
+
+models_app = typer.Typer(name="models", help="Manage local model downloads.", no_args_is_help=True)
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("pull")
+def models_pull(
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="YAML config"),
+) -> None:
+    """Pre-download Whisper, the intent GGUF and the Piper voice."""
+    settings = _command_settings(config)
+    with console.status(f"faster-whisper {settings.whisper_model}…"):
+        from faster_whisper.utils import download_model
+
+        console.print(f"whisper  → {download_model(settings.whisper_model)}")
+    if settings.intent_enabled:
+        from pawn_assistant.commands.llm import resolve_model_path
+
+        with console.status(f"intent LLM {settings.intent_model}…"):
+            console.print(f"intent   → {resolve_model_path(settings.intent_model)}")
+    if settings.tts_enabled:
+        from pawn_assistant.audio.tts import resolve_voice
+
+        with console.status(f"Piper voice {settings.tts_voice}…"):
+            console.print(f"voice    → {resolve_voice(settings.tts_voice)[0]}")
+
+
 wake_train_app = typer.Typer(
     name="wake-train",
     help="Train a custom openWakeWord ONNX model from your own recordings.",
@@ -353,6 +818,23 @@ def wake_record_neg(
         category=category,
         interval=interval,
     )
+
+
+@wake_train_app.command("gen-neg")
+def wake_gen_neg(
+    project: str = typer.Option(..., "--project", "-p"),
+    count: int = typer.Option(600, help="Number of synthetic speech clips"),
+    category: str = typer.Option("speech_tts", help="Negatives sub-folder"),
+    seed: int = typer.Option(0),
+) -> None:
+    """Synthesize speech negatives with Piper (it + en voices, near-miss words)."""
+    from pawn_assistant.wake_train.project import WakeProject
+    from pawn_assistant.wake_train.synth_neg import generate_speech_negatives
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    proj = WakeProject.load(Path(project))
+    out = generate_speech_negatives(proj, count=count, category=category, seed=seed)
+    console.print(f"[green]speech negatives →[/] {out}")
 
 
 @wake_train_app.command("train")

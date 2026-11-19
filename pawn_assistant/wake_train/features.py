@@ -39,6 +39,28 @@ def place_in_window(
     return np.clip(out, -1.0, 1.0).astype(np.float32)
 
 
+def negative_windows(
+    clip: np.ndarray,
+    window_samples: int,
+    rng: np.random.Generator,
+    max_crops: int = 4,
+) -> list[np.ndarray]:
+    """Short clips → one padded window; long clips → several overlapping crops.
+
+    Long speech negatives carry many distinct "not the wake word" contexts; a
+    single random crop wastes most of them.
+    """
+    if clip.size <= window_samples:
+        return [place_in_window(clip, window_samples, rng)]
+    hop = window_samples // 2
+    starts = list(range(0, clip.size - window_samples + 1, hop))
+    if starts[-1] != clip.size - window_samples:
+        starts.append(clip.size - window_samples)  # speech ending at the window edge
+    if len(starts) > max_crops:
+        starts = sorted(rng.choice(starts, size=max_crops, replace=False).tolist())
+    return [clip[s : s + window_samples].astype(np.float32) for s in starts]
+
+
 def embed_window(audio: np.ndarray, sample_rate: int = 16_000) -> np.ndarray:
     """Return shape (N_FRAMES, 96) openWakeWord embedding features."""
     from openwakeword.utils import AudioFeatures
@@ -112,10 +134,12 @@ def build_feature_arrays(
             pos_feats.append(embed_window(windowed, project.sample_rate))
 
     neg_feats: list[np.ndarray] = []
-    for path in neg_paths:
+    for i, path in enumerate(neg_paths, 1):
         clip = load_clip_16k(path, project.sample_rate)
-        windowed = place_in_window(clip, window, rng)
-        neg_feats.append(embed_window(windowed, project.sample_rate))
+        for windowed in negative_windows(clip, window, rng):
+            neg_feats.append(embed_window(windowed, project.sample_rate))
+        if i % 100 == 0:
+            logger.info("negatives %d/%d (%d windows)", i, len(neg_paths), len(neg_feats))
 
     # Synthetic silence / faint-noise negatives (critical — see zero-pad pitfall).
     for _ in range(max(40, len(pos_feats) // 2)):

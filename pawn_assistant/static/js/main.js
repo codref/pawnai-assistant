@@ -21,9 +21,23 @@
     infer: document.getElementById("d-infer"),
     rtf: document.getElementById("d-rtf"),
     rss: document.getElementById("d-rss"),
+    intent: document.getElementById("d-intent"),
+    intentSrc: document.getElementById("d-intent-src"),
+    parse: document.getElementById("d-parse"),
+    ttsMs: document.getElementById("d-tts-ms"),
+    llm: document.getElementById("d-llm"),
+    voice: document.getElementById("d-voice"),
     log: document.getElementById("transcript-log"),
     spark: document.getElementById("wake-spark"),
+    gain: document.getElementById("gain"),
+    gainLabel: document.getElementById("gain-label"),
+    gainOut: document.getElementById("gain-out"),
+    gainKnob: document.getElementById("gain-knob"),
   };
+  let ws = null;
+  let gainDragging = false;
+  let gainTimer = null;
+  let gainUnit = "%";
 
   const presence = PawnPresence.mountPresence(document.getElementById("presence"));
   const sparkScores = [];
@@ -95,12 +109,53 @@
     while (els.log.children.length > 40) els.log.removeChild(els.log.lastChild);
   }
 
+  function appendToLatest(cls, text) {
+    const li = els.log.firstElementChild;
+    if (!li) return;
+    const span = document.createElement("span");
+    span.className = cls;
+    span.textContent = text;
+    li.appendChild(span);
+  }
+
+  function renderGain(g) {
+    els.gain.hidden = false;
+    setText(els.gainLabel, g.label);
+    els.gainKnob.min = g.min;
+    els.gainKnob.max = g.max;
+    els.gainKnob.step = g.step;
+    gainUnit = g.unit;
+    if (!gainDragging) els.gainKnob.value = g.value;
+    showGainValue(g.value, g.db);
+  }
+
+  function showGainValue(value, db) {
+    const v = Number(value);
+    const base = gainUnit === "dB" ? `${v > 0 ? "+" : ""}${v.toFixed(1)} dB` : `${Math.round(v)}%`;
+    const extra = gainUnit !== "dB" && db != null ? ` · ${db > 0 ? "+" : ""}${Number(db).toFixed(1)} dB` : "";
+    setText(els.gainOut, base + extra);
+  }
+
+  els.gainKnob.addEventListener("pointerdown", () => { gainDragging = true; });
+  els.gainKnob.addEventListener("pointerup", () => { gainDragging = false; });
+  els.gainKnob.addEventListener("input", () => {
+    showGainValue(els.gainKnob.value, null);
+    // Throttle: amixer is a subprocess, one call per 120 ms is plenty.
+    clearTimeout(gainTimer);
+    gainTimer = setTimeout(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "set_gain", value: Number(els.gainKnob.value) }));
+      }
+    }, 120);
+  });
+
   function onMeter(m) {
     setText(els.device, m.device_name || "—");
     setText(els.rate, `${m.sample_rate} Hz`);
     setText(els.overruns, String(m.overruns ?? 0));
     setText(els.rms, `${m.rms_db.toFixed(1)} dBFS`);
     setText(els.peak, `${m.peak_db.toFixed(1)} dBFS`);
+    els.peak.classList.toggle("hot", m.peak_db >= -1.0);
     const barW = `${dbToPct(m.rms_db).toFixed(1)}%`;
     if (els.barRms.style.width !== barW) els.barRms.style.width = barW;
     setText(els.wakeScore, m.wake_score.toFixed(3));
@@ -111,6 +166,8 @@
     setText(els.dwell, `${m.since_ms ?? 0} ms`);
     setText(els.whisper, m.whisper_resident ? "resident" : "cold");
     setText(els.rss, `${m.rss_mb} MB`);
+    setText(els.llm, m.llm_resident ? "resident" : "cold");
+    setText(els.voice, m.tts_resident ? "resident" : "cold");
     setState(m.state);
     pushSpark(m.wake_score);
     presence.setTelemetry({
@@ -130,6 +187,37 @@
       els.lastDur.textContent = `${ev.duration_ms} ms`;
       els.infer.textContent = `${ev.infer_ms} ms`;
       els.rtf.textContent = String(ev.rtf);
+    } else if (ev.name === "intent") {
+      const slots = Object.entries(ev.slots || {})
+        .map(([k, v]) => `${k}=${v}`)
+        .join(" ");
+      setText(els.intent, slots ? `${ev.intent} ${slots}` : ev.intent);
+      setText(els.intentSrc, ev.source);
+      setText(els.parse, `${ev.parse_ms} ms`);
+      appendToLatest("intent", `→ ${ev.intent}${slots ? " " + slots : ""} · ${ev.source} · ${ev.parse_ms} ms`);
+    } else if (ev.name === "reply") {
+      setText(els.ttsMs, `${ev.tts_ms} ms`);
+      // Phrased replies stream: seq > 0 updates the line opened by seq 0.
+      const cont = (ev.seq || 0) > 0;
+      if (ev.kind === "alert") {
+        const first = els.log.firstElementChild;
+        if (cont && first && first.classList.contains("alert")) {
+          first.textContent = `⏰ ${ev.text}`;
+        } else {
+          const li = document.createElement("li");
+          li.className = "alert";
+          li.textContent = `⏰ ${ev.text}`;
+          els.log.prepend(li);
+        }
+      } else {
+        const latest = els.log.firstElementChild;
+        const spans = latest ? latest.querySelectorAll("span.reply") : [];
+        if (cont && spans.length) {
+          spans[spans.length - 1].textContent = `PAWN: ${ev.text}`;
+        } else {
+          appendToLatest("reply", `PAWN: ${ev.text}`);
+        }
+      }
     } else if (ev.name === "fault") {
       setState("FAULT");
       const li = document.createElement("li");
@@ -141,7 +229,7 @@
 
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
 
     ws.onopen = () => {
       reconnectDelay = 500;
@@ -160,6 +248,11 @@
         els.device.textContent = data.device_name;
         els.rate.textContent = `${data.sample_rate} Hz`;
         if (data.status && data.status.state) setState(data.status.state);
+        if (data.gain) renderGain(data.gain);
+        return;
+      }
+      if (data.type === "gain") {
+        renderGain(data);
         return;
       }
       if (data.type === "meter") onMeter(data);

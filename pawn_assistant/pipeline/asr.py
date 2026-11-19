@@ -1,8 +1,9 @@
-"""faster-whisper tiny int8 with lazy load / idle unload."""
+"""faster-whisper (int8, CPU) with lazy load / idle unload."""
 
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -26,6 +27,14 @@ class TranscriptResult:
         return self.infer_ms / self.duration_ms
 
 
+def _is_prompt_echo(text: str, prompt: str) -> bool:
+    """True when *text* is (a long-enough slice of) the initial prompt."""
+    words = re.sub(r"[^\w\s]", " ", text.lower()).split()
+    if len(words) < 6:
+        return False
+    return " ".join(words) in " ".join(re.sub(r"[^\w\s]", " ", prompt.lower()).split())
+
+
 class WhisperASR:
     """Lazy faster-whisper wrapper."""
 
@@ -35,12 +44,16 @@ class WhisperASR:
         compute_type: str = "int8",
         idle_unload_s: float = 60.0,
         language: Optional[str] = None,
+        initial_prompt: str = "",
+        vad_filter: bool = True,
     ) -> None:
         self.model_size = model_size
         self.compute_type = compute_type
         self.idle_unload_s = idle_unload_s
         # None → faster-whisper autodetection (Italian / English / …).
         self.language = language
+        self.initial_prompt = initial_prompt.strip()
+        self.vad_filter = vad_filter
         self._model = None
         self._lock = threading.Lock()
         self._last_used = 0.0
@@ -92,7 +105,8 @@ class WhisperASR:
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16_000) -> TranscriptResult:
         self.load()
         assert self._model is not None
-        wav = np.asarray(audio, dtype=np.float32).reshape(-1)
+        # Resampling can overshoot ±1.0; Whisper expects normalised samples.
+        wav = np.clip(np.asarray(audio, dtype=np.float32).reshape(-1), -1.0, 1.0)
         duration_ms = 1000.0 * len(wav) / float(sample_rate)
         t0 = time.perf_counter()
         with self._lock:
@@ -101,11 +115,16 @@ class WhisperASR:
                 language=self.language,
                 beam_size=3,
                 best_of=3,
-                vad_filter=False,
+                vad_filter=self.vad_filter,
+                vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 200},
+                initial_prompt=self.initial_prompt or None,
                 condition_on_previous_text=False,
                 without_timestamps=True,
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
+            # On silence/noise Whisper may parrot the prompt back.
+            if self.initial_prompt and _is_prompt_echo(text, self.initial_prompt):
+                text = ""
             # Drop Whisper hallucinations that appear on short/noisy tails.
             if text.lower() in {
                 "sottotitoli creati dalla comunità amara",

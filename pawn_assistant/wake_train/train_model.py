@@ -83,13 +83,21 @@ def train_and_export(
     vy = torch.from_numpy(val_y).unsqueeze(1)
 
     best_state = None
-    best_score = -1.0
-    n = tx.shape[0]
+    best_score = -1e9
     rng = np.random.default_rng(seed)
+    # Class-balanced batches: negatives (esp. speech) far outnumber positives.
+    pos_idx = np.flatnonzero(train_y >= 0.5)
+    neg_idx = np.flatnonzero(train_y < 0.5)
+    half = max(1, batch_size // 2)
 
     model.train()
     for step in range(1, steps + 1):
-        idx = rng.choice(n, size=min(batch_size, n), replace=False)
+        idx = np.concatenate(
+            [
+                rng.choice(pos_idx, size=half, replace=pos_idx.size < half),
+                rng.choice(neg_idx, size=half, replace=neg_idx.size < half),
+            ]
+        )
         xb = tx[idx].to(device)
         yb = ty[idx].to(device)
         pred = model(xb)
@@ -115,7 +123,8 @@ def train_and_export(
                 # via low-energy: use all negatives' max score.
                 neg_scores = vp[vt < 0.5]
                 pos_scores = vp[vt >= 0.5]
-                score = recall - 0.5 * (fp / max(1.0, (~truth_pos).sum()))
+                # False wakes are the costly error for an always-on mic.
+                score = recall - 2.0 * (fp / max(1.0, (~truth_pos).sum()))
                 logger.info(
                     "step %d loss=%.4f recall=%.2f prec=%.2f "
                     "pos_mean=%.3f neg_mean=%.3f neg_max=%.3f",

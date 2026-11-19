@@ -11,6 +11,12 @@ audio:
   # sounddevice input index from `pawn-assistant list-devices` / `probe`.
   # null = auto (pulse → sysdefault → hw, skipping silent sources).
   device: 0
+  # Input gain. On ALSA hw:N devices this is the mixer control below, in percent
+  # of its range (the HUD knob drives the same control); otherwise software dB.
+  # Unset = leave the mixer alone. Clipping? Try 40.
+  # gain_percent: 40
+  # software_gain_db: 0
+  # gain_control: Capture
   sample_rate: 16000
   channels: 1
   # openWakeWord frame size (80 ms @ 16 kHz).
@@ -45,16 +51,70 @@ vad:
   min_speech_ms: 400
   # After beep, ignore energy fallback this long (ms).
   post_wake_arm_ms: 400
+  # Drop this much from the head of each utterance (wake-beep leakage into the mic).
+  head_trim_ms: 400
 
 asr:
   # faster-whisper size: tiny | base | small | …
   # base is slower on CPU but far better on short Italian commands than tiny.
-  model: base
+  model: small
   compute_type: int8
   # Preferred language: it | en | fr | … — null = autodetection (often messy).
   language: it
   # Unload Whisper from RAM after idle (seconds). 0 = keep loaded.
   idle_unload_s: 120.0
+  # Biases decoding toward your commands; empty = off.
+  initial_prompt: >-
+    Comandi vocali: che ore sono, che giorno è oggi, imposta un timer
+    di cinque minuti, quanto manca al timer, annulla il timer.
+  # faster-whisper's own speech filter: trims non-speech around the command.
+  vad_filter: true
+
+intent:
+  # Fast-path phrase match first; the local LLM only runs on a miss.
+  enabled: true
+  # qwen2.5-1.5b (default, ~1 GB, good Italian) | qwen2.5-0.5b (~0.4 GB, faster)
+  # or a path to any instruct .gguf
+  model: qwen2.5-1.5b
+  # llama.cpp threads — use physical cores (4 on a typical i5).
+  threads: 4
+  # Unload the LLM after idle (seconds). 0 = keep loaded. The prompt KV cache
+  # survives unloads, so a reload costs ~1 s instead of a full prefill.
+  idle_unload_s: 300
+  # difflib similarity needed to skip the LLM (0..1).
+  fastpath_ratio: 0.85
+  # Language of spoken/displayed replies: it | en
+  reply_language: it
+
+tts:
+  # Piper local voice for replies.
+  enabled: true
+  # Voice id from rhasspy/piper-voices (downloaded on first use) or .onnx path.
+  voice: it_IT-paola-medium
+  # >1 slower, <1 faster speech.
+  length_scale: 1.0
+  volume: 1.0
+  # Multi-speaker voices only (see `pawn-assistant voice list`); omit for default.
+  # speaker_id: 0
+  idle_unload_s: 300
+
+phrase:
+  # The intent LLM rewords each deterministic reply so PAWN sounds less
+  # canned. Numbers/weekdays/months are checked; on any failure or timeout
+  # the original reply is spoken. Needs intent.enabled.
+  enabled: true
+  # Persona for the rewording prompt. Empty = built-in dry HUD voice.
+  persona: >-
+    Sei PAWN, un assistente vocale da HUD: asciutto, preciso, con un filo di ironia.
+  # Higher = more varied, but the 1.5B model gets odd above ~0.7.
+  temperature: 0.6
+  top_p: 0.95
+  max_tokens: 60
+  max_sentences: 2
+  # Seconds to wait for the first spoken sentence before falling back.
+  first_sentence_timeout_s: 2.5
+  # all | list of intents, e.g. [greeting, unknown, timer.alert]
+  intents: all
 
 beep:
   freq_hz: 880.0

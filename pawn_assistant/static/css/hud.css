@@ -21,6 +21,8 @@
   --cyan-dim: #1a6a78;
   --amber: #ffb020;
   --fault: #ff3d6e;
+  --think: #c77dff;
+  --speak: #7dffb0;
   --text: #c8e8ef;
   --muted: #6a8a94;
   --clip: 12px;
@@ -123,6 +125,18 @@ body {
   animation: pulse 0.9s ease-in-out infinite;
 }
 
+.chip[data-state="THINK"] {
+  border-color: var(--think);
+  color: var(--think);
+  animation: pulse 0.6s ease-in-out infinite;
+}
+
+.chip[data-state="SPEAK"] {
+  border-color: var(--speak);
+  color: var(--speak);
+  box-shadow: 0 0 12px rgba(125, 255, 176, 0.25);
+}
+
 .chip[data-state="FAULT"] {
   border-color: var(--fault);
   color: var(--fault);
@@ -217,6 +231,41 @@ body {
   transition: width 80ms linear;
 }
 
+.gain {
+  margin-top: 0.7rem;
+}
+
+.gain[hidden] {
+  display: none;
+}
+
+.gain label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.gain output {
+  color: var(--cyan);
+}
+
+.gain input[type="range"] {
+  width: 100%;
+  margin: 0.35rem 0 0;
+  accent-color: var(--cyan);
+}
+
+.gain-hint {
+  margin: 0.2rem 0 0;
+  font-size: 0.66rem;
+  color: var(--muted);
+}
+
+.panel dd.hot {
+  color: var(--fault);
+}
+
 #wake-spark {
   display: block;
   width: 100%;
@@ -254,6 +303,21 @@ body {
   display: block;
   color: var(--muted);
   font-size: 0.7rem;
+}
+
+.log li .intent {
+  display: block;
+  color: var(--think);
+  font-size: 0.72rem;
+}
+
+.log li .reply {
+  display: block;
+  color: var(--speak);
+}
+
+.log li.alert {
+  color: var(--amber);
 }
 
 .log li.empty {

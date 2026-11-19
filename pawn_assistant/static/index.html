@@ -12,7 +12,7 @@
   <div class="frame">
     <header class="mast">
       <h1 class="brand">PAWN</h1>
-      <p class="tag">wake loop · point 1</p>
+      <p class="tag">wake loop · point 2 · commands</p>
       <div id="state-chip" class="chip" data-state="IDLE">IDLE</div>
     </header>
 
@@ -32,6 +32,11 @@
         </dl>
         <div class="bar-wrap" title="RMS">
           <div id="bar-rms" class="bar"></div>
+        </div>
+        <div class="gain" id="gain" hidden>
+          <label for="gain-knob"><span id="gain-label">gain</span><output id="gain-out">—</output></label>
+          <input id="gain-knob" type="range" min="0" max="100" step="1" value="50" />
+          <p class="gain-hint" id="gain-hint">aim for peaks around −6 dBFS; red = clipping</p>
         </div>
       </section>
 
@@ -56,6 +61,18 @@
           <dt>infer</dt><dd id="d-infer">—</dd>
           <dt>rtf</dt><dd id="d-rtf">—</dd>
           <dt>rss</dt><dd id="d-rss">—</dd>
+        </dl>
+      </section>
+
+      <section class="panel">
+        <h2>command</h2>
+        <dl>
+          <dt>intent</dt><dd id="d-intent">—</dd>
+          <dt>via</dt><dd id="d-intent-src">—</dd>
+          <dt>parse</dt><dd id="d-parse">—</dd>
+          <dt>tts</dt><dd id="d-tts-ms">—</dd>
+          <dt>llm</dt><dd id="d-llm">cold</dd>
+          <dt>voice</dt><dd id="d-voice">cold</dd>
         </dl>
       </section>
 

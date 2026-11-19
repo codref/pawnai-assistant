@@ -6,7 +6,7 @@ Always-listening companion for the PawnAI family. Runs on a Linux laptop (i5, 8 
 
 | Package | Role for the assistant |
 |---------|------------------------|
-| **pawnai-assistant** (this repo) | Always-on ear: wake → command ASR → local phrases / agent turns → HUD |
+| **pawnai-assistant** (this repo) | Always-on ear: wake → command ASR → local intents + spoken replies / agent turns → HUD |
 | **pawnai-recorder** | Session capture: chunked FLAC, S3 upload, `transcribe-diarize` queue jobs. Control via `pawnai-recorder serve` on `127.0.0.1:8765` |
 | **pawnai** (`pawn-server`) | Agent chat, vault tools, sallm memory, Kokoro TTS, heavy ASR/diarize workers |
 
@@ -22,18 +22,21 @@ Point-1 Python is **3.11** only: openWakeWord depends on `tflite-runtime`, which
 |----------|------------|--------------|
 | Always | openWakeWord + ONNX Runtime | &lt; 100 MB, few % of one core |
 | Always | Silero VAD (ONNX) | shared with wake runtime |
-| After wake | faster-whisper `tiny` int8 | load on demand; unload after idle |
-| Reply (later) | Kokoro via `POST /v1/audio/speech` on pawn-server | prefer remote; local only if needed |
+| After wake | faster-whisper `tiny`/`base` int8 | load on demand; unload after idle |
+| After wake | Intent LLM Qwen2.5-1.5B Q4_K_M (llama.cpp, in-process) | ~1.3 GB; prefetched on wake, unload after idle |
+| Reply | Piper `it_IT-paola-medium` (local) | ~150 MB; unload after idle |
+| Reply (later, agent turns) | Kokoro via `POST /v1/audio/speech` on pawn-server | prefer remote |
 | Later | Chat | pawn-server; keep 4B Ollama off this box if diarize also runs here |
 
 Desktop OS already uses ~1.5–2.5 GB. Keep the always-on loop under ~200 MB when Whisper is unloaded.
 
 ## Point roadmap
 
-1. **Wake loop (this scaffold)** — wake word, beep, VAD utterance, tiny Whisper transcript, cyberpunk HUD. No Pawn network.
-2. **Recorder phrases** — local intent list → `POST /sessions/start|stop|flush|notes` on recorder serve.
-3. **Agent turns** — other utterances → `POST /v1/pawn/chat`; speak replies via `/v1/audio/speech`.
-4. **Later** — custom “hey pawn”, streaming Zipformer, barge-in / AEC.
+1. **Wake loop** — wake word, beep, VAD utterance, Whisper transcript, cyberpunk HUD. No Pawn network.
+2. **Local command words** — fast-path phrases + small local LLM (grammar-forced intent JSON) → deterministic handlers (time, date, timers, cancel) → Piper reply. See [`02-commands.md`](02-commands.md).
+3. **Recorder phrases** — new intents → `POST /sessions/start|stop|flush|notes` on recorder serve.
+4. **Agent turns** — `unknown` utterances → `POST /v1/pawn/chat`; speak replies via `/v1/audio/speech`.
+5. **Later** — custom “hey pawn” polish, streaming Zipformer, barge-in / AEC.
 
 ## Integration contracts (later points)
 

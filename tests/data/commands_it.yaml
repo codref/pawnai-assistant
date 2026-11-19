@@ -1,0 +1,55 @@
+# Intent eval set — `pawn-assistant ask --eval tests/data/commands_it.yaml`
+# Mix of canonical phrasings, Whisper-style mistakes, paraphrases (LLM path)
+# and off-domain lines that must land on `unknown`.
+
+# time.now
+- {text: "Che ora è?", intent: time.now}
+- {text: "che ore e'", intent: time.now}
+- {text: "Che ore sono.", intent: time.now}
+- {text: "Mi sai dire l'orario per cortesia?", intent: time.now}
+- {text: "Che ore si sono fatte?", intent: time.now}
+- {text: "Jarvis, che ore sono?", intent: time.now}
+- {text: "A che ora siamo arrivati?", intent: time.now}
+- {text: "What time is it?", intent: time.now}
+
+# date.today
+- {text: "Che giorno è oggi?", intent: date.today}
+- {text: "Quanti ne abbiamo oggi?", intent: date.today}
+- {text: "In che giorno della settimana siamo?", intent: date.today}
+- {text: "Oggi che data è?", intent: date.today}
+- {text: "Che mese è?", intent: date.today}
+- {text: "What's the date today?", intent: date.today}
+
+# timer.set
+- {text: "Metti un timer di cinque minuti.", intent: timer.set, slots: {minutes: 5}}
+- {text: "Timer di 10 secondi.", intent: timer.set, slots: {seconds: 10}}
+- {text: "Timer di un'ora e mezza.", intent: timer.set, slots: {hours: 1, minutes: 30}}
+- {text: "Avvisami tra venti minuti.", intent: timer.set, slots: {minutes: 20}}
+- {text: "Fammi partire un conto alla rovescia di tre minuti e venti.", intent: timer.set, slots: {minutes: 3, seconds: 20}}
+- {text: "Sveglia tra un quarto d'ora.", intent: timer.set, slots: {minutes: 15}}
+- {text: "Fra due minuti dimmi che la pasta è pronta.", intent: timer.set, slots: {minutes: 2}}
+- {text: "Puoi contare 45 secondi?", intent: timer.set, slots: {seconds: 45}}
+- {text: "Set a timer for 90 seconds.", intent: timer.set, slots: {seconds: 90}}
+
+# cancel
+- {text: "Annulla il timer.", intent: cancel}
+- {text: "Stop.", intent: cancel}
+- {text: "Basta così.", intent: cancel}
+- {text: "Toglimi quel timer.", intent: cancel}
+- {text: "Lascia perdere.", intent: cancel}
+- {text: "Ferma il conto alla rovescia.", intent: cancel}
+- {text: "Never mind.", intent: cancel}
+
+# greeting
+- {text: "Ciao!", intent: greeting}
+- {text: "Buongiorno.", intent: greeting}
+- {text: "Come va oggi, amico?", intent: greeting}
+- {text: "Ehi, tutto bene?", intent: greeting}
+
+# unknown (off-domain — no handler yet)
+- {text: "Che tempo fa a Roma?", intent: unknown}
+- {text: "Raccontami una barzelletta.", intent: unknown}
+- {text: "Accendi la luce in cucina.", intent: unknown}
+- {text: "Chi ha vinto la partita ieri?", intent: unknown}
+- {text: "Metti un po' di musica.", intent: unknown}
+- {text: "Sottotitoli a cura di", intent: unknown}

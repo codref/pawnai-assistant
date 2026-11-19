@@ -108,12 +108,23 @@ def create_app(settings: Settings, wake_loop: Optional[WakeLoop] = None) -> Fast
             "device_name": wl.capture.device_info.name,
             "sample_rate": settings.sample_rate,
             "status": wl.snapshot_status(),
+            "gain": await asyncio.to_thread(wl.gain.state),
         }
         await ws.send_text(json.dumps(hello))
         try:
             while True:
-                # Client messages ignored for now (HUD is observe-only).
-                await ws.receive_text()
+                raw = await ws.receive_text()
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(msg, dict) and msg.get("type") == "set_gain":
+                    try:
+                        value = float(msg["value"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    state = await asyncio.to_thread(wl.gain.set, value)
+                    await hub._broadcast({"type": "gain", **state})
         except WebSocketDisconnect:
             pass
         finally:

@@ -321,12 +321,21 @@ class AudioCapture:
         self._pcm_carry = np.zeros(0, dtype=np.float32)
         self._utt_recording = False
         self._utt_native: list[np.ndarray] = []
+        self.gain_db = 0.0
+        self._gain_lin = 1.0
+
+    def set_gain_db(self, db: float) -> None:
+        """Digital gain applied to every callback block (cheap multiply)."""
+        self.gain_db = float(db)
+        self._gain_lin = 10.0 ** (self.gain_db / 20.0)
 
     def _callback(self, indata, frames, time_info, status) -> None:  # noqa: ANN001
         # Keep this path tiny — any heavy work here causes PaInputOverflow.
         if status:
             self.overruns += 1
         mono = np.asarray(indata[:, 0], dtype=np.float32).copy()
+        if self._gain_lin != 1.0:
+            np.clip(mono * self._gain_lin, -1.0, 1.0, out=mono)
         with self._cond:
             self._native.append(mono)
             if self._utt_recording:

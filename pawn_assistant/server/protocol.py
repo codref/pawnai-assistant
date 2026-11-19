@@ -20,6 +20,8 @@ class MeterMessage(BaseModel):
     rss_mb: float
     overruns: int = 0
     whisper_resident: bool = False
+    llm_resident: bool = False
+    tts_resident: bool = False
     device_name: str = ""
     sample_rate: int = 16_000
 
@@ -45,13 +47,53 @@ class TranscriptEvent(BaseModel):
     rtf: float
 
 
+class IntentEvent(BaseModel):
+    type: Literal["event"] = "event"
+    name: Literal["intent"] = "intent"
+    intent: str
+    slots: dict = Field(default_factory=dict)
+    source: Literal["fastpath", "llm", "none"]
+    parse_ms: float
+
+
+class ReplyEvent(BaseModel):
+    type: Literal["event"] = "event"
+    name: Literal["reply"] = "reply"
+    kind: Literal["reply", "alert"] = "reply"
+    text: str
+    tts_ms: float = 0.0
+
+
 class FaultEvent(BaseModel):
     type: Literal["event"] = "event"
     name: Literal["fault"] = "fault"
     message: str
 
 
-EventMessage = Union[StateEvent, BeepEvent, TranscriptEvent, FaultEvent]
+EventMessage = Union[
+    StateEvent, BeepEvent, TranscriptEvent, IntentEvent, ReplyEvent, FaultEvent
+]
+
+
+class GainMessage(BaseModel):
+    """Server → client on hello and after every ``set_gain``."""
+
+    type: Literal["gain"] = "gain"
+    backend: Literal["alsa", "software"]
+    label: str
+    value: float
+    min: float
+    max: float
+    step: float
+    unit: str
+    db: Optional[float] = None
+
+
+class SetGainMessage(BaseModel):
+    """Client → server: percent for ``alsa``, dB for ``software``."""
+
+    type: Literal["set_gain"] = "set_gain"
+    value: float
 
 
 class HelloMessage(BaseModel):
@@ -61,3 +103,4 @@ class HelloMessage(BaseModel):
     device_name: str
     sample_rate: int
     status: dict = Field(default_factory=dict)
+    gain: Optional[dict] = None

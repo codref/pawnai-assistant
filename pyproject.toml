@@ -25,6 +25,12 @@ dependencies = [
     "pydantic>=2.0.0",
     "PyYAML>=6.0",
     "scipy>=1.10.0",
+    # Point 2 — local command intents + spoken replies.
+    # Prebuilt CPU wheels (avoid a source build):
+    #   uv pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+    "llama-cpp-python>=0.3.0",
+    "piper-tts>=1.2.0",
+    "huggingface-hub>=0.20.0",
 ]
 
 [project.optional-dependencies]

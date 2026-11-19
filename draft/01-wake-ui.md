@@ -27,6 +27,8 @@ mic → capture → wake / VAD / ASR (Python)
 | `LISTEN` | Capturing speech (VAD) |
 | `HOLD` | Trailing silence before end-of-utterance |
 | `BUSY` | faster-whisper running |
+| `THINK` | intent parsing (point 2) |
+| `SPEAK` | Piper reply / timer alert playing (point 2) |
 | `FAULT` | Device or model failure |
 
 ## WebSocket protocol
@@ -59,8 +61,12 @@ URL: `ws://127.0.0.1:8787/ws`
 {"type": "event", "name": "state", "state": "LISTEN", "since_ms": 0}
 {"type": "event", "name": "beep"}
 {"type": "event", "name": "transcript", "text": "…", "duration_ms": 1200, "infer_ms": 340, "rtf": 0.28}
+{"type": "event", "name": "intent", "intent": "time.now", "slots": {}, "source": "fastpath", "parse_ms": 0.3}
+{"type": "event", "name": "reply", "kind": "reply", "text": "Sono le 14 e 35.", "tts_ms": 60.1}
 {"type": "event", "name": "fault", "message": "…"}
 ```
+
+Meter also carries `llm_resident` and `tts_resident` (point 2).
 
 HUD never drives the microphone.
 

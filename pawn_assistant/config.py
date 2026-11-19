@@ -43,14 +43,29 @@ class Settings:
     min_speech_ms: int = 400
     # After beep, ignore energy fallback this long (wake-word echo / room).
     post_wake_arm_ms: int = 400
+    # Drop this much audio from the head of each utterance: the wake beep leaks
+    # from the speaker into the mic and Whisper would otherwise hear a tone.
+    head_trim_ms: int = 400
     beep_mute_ms: int = 600
     # Refractory after a full turn so openWakeWord can refill features.
     wake_debounce_ms: int = 1_200
-    whisper_model: str = "tiny"
+    whisper_model: str = "small"
     whisper_compute_type: str = "int8"
     whisper_idle_unload_s: float = 60.0
     # Preferred ASR language (it/en/…). None → faster-whisper autodetection.
     asr_language: Optional[str] = None
+    # Biases decoding toward the command vocabulary. Empty = no prompt.
+    asr_initial_prompt: str = (
+        "Comandi vocali: che ore sono, che giorno è oggi, imposta un timer "
+        "di cinque minuti, quanto manca al timer, annulla il timer."
+    )
+    # Let faster-whisper's own Silero pass cut leading/trailing non-speech.
+    asr_vad_filter: bool = True
+    # Input gain. ALSA hw devices: percent of the mixer ``gain_control`` range
+    # (applied at startup when set). Other devices: software gain in dB.
+    input_gain_percent: Optional[float] = None
+    software_gain_db: float = 0.0
+    gain_control: str = "Capture"
     meter_hz: float = 20.0
     beep_freq_hz: float = 880.0
     beep_duration_ms: int = 120
@@ -60,6 +75,40 @@ class Settings:
     debug_preroll_s: float = 8.0
     # Dump preroll when wake score crosses this (near-miss debugging).
     debug_wake_score_dump: float = 0.25
+
+    # Point 2 — command intents (fast-path + local llama.cpp model).
+    intent_enabled: bool = True
+    # Alias (qwen2.5-1.5b / qwen2.5-0.5b) or a local .gguf path.
+    intent_model: str = "qwen2.5-1.5b"
+    intent_threads: int = 4
+    intent_idle_unload_s: float = 300.0
+    # difflib ratio needed for a fast-path (no LLM) match.
+    intent_fastpath_ratio: float = 0.85
+    # Reply language for handlers (it/en).
+    reply_language: str = "it"
+
+    # Point 2 — spoken replies (Piper).
+    tts_enabled: bool = True
+    # Piper voice id (rhasspy/piper-voices) or a local .onnx path.
+    tts_voice: str = "it_IT-paola-medium"
+    tts_length_scale: float = 1.0
+    tts_volume: float = 1.0
+    # Speaker index for multi-speaker voices (None = voice default).
+    tts_speaker_id: Optional[int] = None
+    tts_idle_unload_s: float = 300.0
+
+    # Point 2 — LLM rephrasing of replies (same model as the intent parser).
+    phrase_enabled: bool = True
+    # System-prompt persona; empty = built-in default for reply_language.
+    phrase_persona: str = ""
+    phrase_temperature: float = 0.6
+    phrase_top_p: float = 0.95
+    phrase_max_tokens: int = 60
+    phrase_max_sentences: int = 2
+    # No valid first sentence within this budget → speak the canonical reply.
+    phrase_first_sentence_timeout_s: float = 2.5
+    # "all" or a list of intent names (timer.alert = spoken timer alerts).
+    phrase_intents: Any = "all"
 
     # Path the settings were loaded from (informational).
     config_path: Optional[str] = None
@@ -108,6 +157,9 @@ def _flatten_yaml(data: Mapping[str, Any]) -> dict[str, Any]:
         ("audio", "sample_rate"): "sample_rate",
         ("audio", "channels"): "channels",
         ("audio", "frame_samples"): "frame_samples",
+        ("audio", "gain_percent"): "input_gain_percent",
+        ("audio", "software_gain_db"): "software_gain_db",
+        ("audio", "gain_control"): "gain_control",
         ("wake", "model"): "wake_model",
         ("wake", "threshold"): "wake_threshold",
         ("wake", "stir_threshold"): "stir_threshold",
@@ -121,10 +173,13 @@ def _flatten_yaml(data: Mapping[str, Any]) -> dict[str, Any]:
         ("vad", "speech_start_ms"): "speech_start_ms",
         ("vad", "min_speech_ms"): "min_speech_ms",
         ("vad", "post_wake_arm_ms"): "post_wake_arm_ms",
+        ("vad", "head_trim_ms"): "head_trim_ms",
         ("asr", "model"): "whisper_model",
         ("asr", "compute_type"): "whisper_compute_type",
         ("asr", "language"): "asr_language",
         ("asr", "idle_unload_s"): "whisper_idle_unload_s",
+        ("asr", "initial_prompt"): "asr_initial_prompt",
+        ("asr", "vad_filter"): "asr_vad_filter",
         ("beep", "freq_hz"): "beep_freq_hz",
         ("beep", "duration_ms"): "beep_duration_ms",
         ("beep", "volume"): "beep_volume",
@@ -132,6 +187,26 @@ def _flatten_yaml(data: Mapping[str, Any]) -> dict[str, Any]:
         ("debug", "audio_dir"): "debug_audio_dir",
         ("debug", "preroll_s"): "debug_preroll_s",
         ("debug", "wake_score_dump"): "debug_wake_score_dump",
+        ("intent", "enabled"): "intent_enabled",
+        ("intent", "model"): "intent_model",
+        ("intent", "threads"): "intent_threads",
+        ("intent", "idle_unload_s"): "intent_idle_unload_s",
+        ("intent", "fastpath_ratio"): "intent_fastpath_ratio",
+        ("intent", "reply_language"): "reply_language",
+        ("tts", "enabled"): "tts_enabled",
+        ("tts", "voice"): "tts_voice",
+        ("tts", "length_scale"): "tts_length_scale",
+        ("tts", "volume"): "tts_volume",
+        ("tts", "speaker_id"): "tts_speaker_id",
+        ("tts", "idle_unload_s"): "tts_idle_unload_s",
+        ("phrase", "enabled"): "phrase_enabled",
+        ("phrase", "persona"): "phrase_persona",
+        ("phrase", "temperature"): "phrase_temperature",
+        ("phrase", "top_p"): "phrase_top_p",
+        ("phrase", "max_tokens"): "phrase_max_tokens",
+        ("phrase", "max_sentences"): "phrase_max_sentences",
+        ("phrase", "first_sentence_timeout_s"): "phrase_first_sentence_timeout_s",
+        ("phrase", "intents"): "phrase_intents",
     }
     for keys, field_name in mapping.items():
         if _dig(data, *keys, default=_MISSING) is not _MISSING:

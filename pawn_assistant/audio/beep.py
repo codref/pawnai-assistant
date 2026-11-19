@@ -32,20 +32,45 @@ def _wav_bytes(
     return pcm.tobytes()
 
 
-def play_beep(
-    sample_rate: int = 16_000,
-    freq_hz: float = 880.0,
-    duration_ms: int = 120,
-    volume: float = 0.25,
+def _play_wav_file(path: Path, timeout: float) -> bool:
+    players = [
+        ["paplay", str(path)],
+        ["pw-play", str(path)],
+        ["aplay", "-q", str(path)],
+    ]
+    for cmd in players:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(
+                cmd,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("playback via %s failed: %s", cmd[0], exc)
+    logger.warning("no paplay/pw-play/aplay — skipping audio playback")
+    return False
+
+
+def play_pcm(
+    pcm: bytes,
+    sample_rate: int,
+    *,
+    block: bool = True,
+    timeout: float = 60.0,
 ) -> None:
-    """Play a sine beep without touching the sounddevice capture stream.
+    """Play mono int16 PCM through an external player (never sounddevice).
 
     Uses ``paplay`` / ``pw-play`` / ``aplay`` so exclusive ALSA ``hw:X,Y``
     input is not interrupted by a concurrent PortAudio output stream.
     """
 
     def _run() -> None:
-        pcm = _wav_bytes(sample_rate, freq_hz, duration_ms, volume)
+        path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 path = Path(tmp.name)
@@ -54,36 +79,43 @@ def play_beep(
                 wf.setsampwidth(2)
                 wf.setframerate(sample_rate)
                 wf.writeframes(pcm)
-
-            players = [
-                ["paplay", str(path)],
-                ["pw-play", str(path)],
-                ["aplay", "-q", str(path)],
-            ]
-            played = False
-            for cmd in players:
-                if not shutil.which(cmd[0]):
-                    continue
-                try:
-                    subprocess.run(
-                        cmd,
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=5,
-                    )
-                    played = True
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("beep via %s failed: %s", cmd[0], exc)
-            if not played:
-                logger.warning("no paplay/pw-play/aplay — skipping audible beep")
+            _play_wav_file(path, timeout)
         except Exception:  # noqa: BLE001
-            logger.exception("beep failed")
+            logger.exception("playback failed")
         finally:
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:  # noqa: BLE001
-                pass
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
 
-    threading.Thread(target=_run, name="pawn-beep", daemon=True).start()
+    if block:
+        _run()
+    else:
+        threading.Thread(target=_run, name="pawn-play", daemon=True).start()
+
+
+def tone_pcm(
+    sample_rate: int = 16_000,
+    freq_hz: float = 880.0,
+    duration_ms: int = 120,
+    volume: float = 0.25,
+) -> bytes:
+    return _wav_bytes(sample_rate, freq_hz, duration_ms, volume)
+
+
+def play_beep(
+    sample_rate: int = 16_000,
+    freq_hz: float = 880.0,
+    duration_ms: int = 120,
+    volume: float = 0.25,
+    *,
+    block: bool = False,
+) -> None:
+    """Play a sine beep without touching the sounddevice capture stream."""
+    play_pcm(
+        _wav_bytes(sample_rate, freq_hz, duration_ms, volume),
+        sample_rate,
+        block=block,
+        timeout=5.0,
+    )

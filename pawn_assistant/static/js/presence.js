@@ -9,6 +9,8 @@
     LISTEN: 0x3de7ff,
     HOLD: 0x7ad4e0,
     BUSY: 0xffb020,
+    THINK: 0xc77dff,
+    SPEAK: 0x7dffb0,
     FAULT: 0xff3d6e,
   };
 
@@ -98,9 +100,15 @@
         this.glyphColor = color;
         this.glyph.setColor("#" + color.toString(16).padStart(6, "0"));
       }
-      this.glyph.setAlpha(0.55 + 0.45 * Math.max(stir, this.flash, this.pawnState === "BUSY" ? 0.7 : 0));
+      this.glyph.setAlpha(0.55 + 0.45 * Math.max(stir, this.flash, this.pawnState === "BUSY" || this.pawnState === "THINK" ? 0.7 : 0));
 
-      if (this.pawnState === "BUSY") {
+      if (this.pawnState === "SPEAK") {
+        const wave = 0.5 + 0.5 * Math.sin(this.time.now / 110);
+        this.ring.lineStyle(3, 0x7dffb0, 0.35 + 0.4 * wave);
+        this.ring.strokeCircle(cx, cy, baseR * (1.08 + 0.12 * wave));
+      }
+
+      if (this.pawnState === "BUSY" || this.pawnState === "THINK") {
         this.glyph.rotation = (this.time.now / 900) % (Math.PI * 2);
       } else {
         this.glyph.rotation *= 0.9;

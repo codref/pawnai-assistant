@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from enum import Enum
@@ -13,7 +14,19 @@ import numpy as np
 import psutil
 
 from pawn_assistant.audio.beep import play_beep
+from pawn_assistant.audio.tts import PiperTTS
+from pawn_assistant.commands import CommandContext, CommandRouter, TimerManager
+from pawn_assistant.commands.handlers import timer_alert_text
+from pawn_assistant.commands.llm import IntentLLM
+from pawn_assistant.commands.phrasing import (
+    ALERT_INTENT,
+    PhraseFailed,
+    PhraseSettings,
+    PhraseStats,
+    ReplyPhraser,
+)
 from pawn_assistant.audio.capture import AudioCapture, resample_mono
+from pawn_assistant.audio.gain import InputGain
 from pawn_assistant.audio.debug_dump import DebugAudioDump
 from pawn_assistant.config import Settings
 from pawn_assistant.pipeline.asr import WhisperASR
@@ -32,6 +45,8 @@ class State(str, Enum):
     LISTEN = "LISTEN"
     HOLD = "HOLD"
     BUSY = "BUSY"
+    THINK = "THINK"
+    SPEAK = "SPEAK"
     FAULT = "FAULT"
 
 
@@ -43,6 +58,10 @@ def _dbfs(samples: np.ndarray) -> tuple[float, float]:
     peak_db = 20.0 * np.log10(peak) if peak > 1e-9 else -120.0
     rms_db = 20.0 * np.log10(rms) if rms > 1e-9 else -120.0
     return rms_db, peak_db
+
+
+# States in which the mic is ignored (worker thread owns the turn).
+_BUSY_STATES = (State.BUSY, State.THINK, State.SPEAK)
 
 
 class WakeLoop:
@@ -63,6 +82,7 @@ class WakeLoop:
             frame_samples=settings.frame_samples,
             device=settings.device,
         )
+        self.gain = InputGain(self.capture, control=settings.gain_control)
         self.wake = WakeDetector(settings.wake_model)
         self.vad = SileroVAD(threshold=settings.vad_threshold)
         self.asr = WhisperASR(
@@ -70,7 +90,41 @@ class WakeLoop:
             compute_type=settings.whisper_compute_type,
             idle_unload_s=settings.whisper_idle_unload_s,
             language=settings.asr_language,
+            initial_prompt=settings.asr_initial_prompt,
+            vad_filter=settings.asr_vad_filter,
         )
+        # Point 2 — commands + spoken replies.
+        self._alerts: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+        self.llm: Optional[IntentLLM] = None
+        self.router: Optional[CommandRouter] = None
+        if settings.intent_enabled:
+            self.llm = IntentLLM(
+                model=settings.intent_model,
+                n_threads=settings.intent_threads,
+                idle_unload_s=settings.intent_idle_unload_s,
+            )
+            self.router = CommandRouter(
+                ctx=CommandContext(
+                    lang=settings.reply_language,
+                    timers=TimerManager(on_fire=self._alerts.put),
+                ),
+                llm=self.llm,
+                fastpath_ratio=settings.intent_fastpath_ratio,
+            )
+        self.phraser: Optional[ReplyPhraser] = None
+        if self.llm is not None and settings.phrase_enabled:
+            self.phraser = ReplyPhraser(self.llm, PhraseSettings.from_settings(settings))
+            self.llm.add_warmup(self.phraser.warmup)
+        self.tts: Optional[PiperTTS] = None
+        if settings.tts_enabled:
+            self.tts = PiperTTS(
+                voice=settings.tts_voice,
+                length_scale=settings.tts_length_scale,
+                volume=settings.tts_volume,
+                idle_unload_s=settings.tts_idle_unload_s,
+                speaker_id=settings.tts_speaker_id,
+            )
+
         self.debug: Optional[DebugAudioDump] = None
         if settings.debug_audio_dir:
             self.debug = DebugAudioDump(
@@ -115,10 +169,20 @@ class WakeLoop:
                 "wake_model": self.settings.wake_model,
                 "wake_threshold": self.settings.wake_threshold,
                 "whisper_resident": self.asr.resident,
+                "llm_resident": self.llm_resident,
+                "tts_resident": self.tts_resident,
                 "overruns": self.capture.overruns,
                 "rss_mb": self._rss_mb(),
                 "debug_audio": str(self.debug.directory) if self.debug else None,
             }
+
+    @property
+    def llm_resident(self) -> bool:
+        return bool(self.llm and self.llm.resident)
+
+    @property
+    def tts_resident(self) -> bool:
+        return bool(self.tts and self.tts.resident)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -132,9 +196,13 @@ class WakeLoop:
             self._set_state(State.FAULT)
             self._emit_event({"type": "event", "name": "fault", "message": str(exc)})
             raise
+        self._apply_startup_gain()
         self._last_frame_at = time.monotonic()
         self._thread = threading.Thread(target=self._run, name="pawn-wake-loop", daemon=True)
         self._thread.start()
+        # Prefill the intent prompt once at boot; its KV state then survives
+        # idle unloads, so later reloads cost ~1 s instead of several.
+        self._prefetch_models()
         logger.info(
             "wake loop started device=%r model=%s threshold=%.2f debug=%s",
             self.capture.device_info.name,
@@ -142,6 +210,15 @@ class WakeLoop:
             self.settings.wake_threshold,
             self.settings.debug_audio_dir,
         )
+
+    def _apply_startup_gain(self) -> None:
+        cfg = self.settings
+        if self.gain.backend == "alsa":
+            if cfg.input_gain_percent is not None:
+                self.gain.set(cfg.input_gain_percent)
+        elif cfg.software_gain_db:
+            self.gain.set(cfg.software_gain_db)
+        logger.info("input gain %s", self.gain.state())
 
     def stop(self) -> None:
         self._stop.set()
@@ -200,6 +277,8 @@ class WakeLoop:
             "overruns": self.capture.overruns,
             "queue_depth": self.capture.queue_depth,
             "whisper_resident": self.asr.resident,
+            "llm_resident": self.llm_resident,
+            "tts_resident": self.tts_resident,
             "device_name": self.capture.device_info.name,
             "sample_rate": self.settings.sample_rate,
             "stream_rate": self.capture.device_info.stream_rate,
@@ -258,7 +337,7 @@ class WakeLoop:
                 if (
                     self._last_frame_at
                     and time.monotonic() - self._last_frame_at > 2.0
-                    and self._state not in (State.BUSY, State.FAULT)
+                    and self._state not in _BUSY_STATES + (State.FAULT,)
                 ):
                     logger.warning("no audio frames for 2s — restarting capture")
                     try:
@@ -286,13 +365,15 @@ class WakeLoop:
                 self._utterance.clear()
                 time.sleep(0.5)
                 self._return_to_idle()
+            self._maybe_play_alert()
             self._emit_meter()
 
     def _handle_frame(self, frame: np.ndarray, frame_ms: float) -> None:
         self._last_rms, self._last_peak = _dbfs(frame)
         muted = time.monotonic() < self._wake_mute_until
 
-        if self._state == State.BUSY:
+        if self._state in _BUSY_STATES:
+            # Includes SPEAK: no AEC yet, so never score PAWN's own voice.
             self._wake_score = 0.0
             return
 
@@ -453,6 +534,26 @@ class WakeLoop:
         # latch "heard speech" and burn the silence budget before you talk.
         self.capture.drain()
         self.capture.start_utt_record()
+        self._prefetch_models()
+
+    def _prefetch_models(self) -> None:
+        """Load LLM (+ prompt prefix) and voice while the user is still talking."""
+        jobs = []
+        if self.llm is not None and not self.llm.resident:
+            jobs.append(self.llm.warmup)
+        if self.tts is not None and not self.tts.resident:
+            jobs.append(self.tts.load)
+        if not jobs:
+            return
+
+        def _run() -> None:
+            for job in jobs:
+                try:
+                    job()
+                except Exception:  # noqa: BLE001
+                    logger.exception("model prefetch failed")
+
+        threading.Thread(target=_run, name="pawn-prefetch", daemon=True).start()
 
     def _begin_transcribe(self) -> None:
         audio = self._utt_audio_16k()
@@ -465,6 +566,12 @@ class WakeLoop:
         )
         if trim > 0 and audio.size > trim:
             audio = audio[:-trim]
+
+        # Head: wake-beep leakage from speaker to mic.
+        head = int(self.settings.sample_rate * self.settings.head_trim_ms / 1000.0)
+        min_keep = int(self.settings.sample_rate * 0.3)
+        if head > 0 and audio.size > head + min_keep:
+            audio = audio[head:]
 
         dur_s = audio.size / float(self.settings.sample_rate) if audio.size else 0.0
         if self.debug is not None:
@@ -507,6 +614,8 @@ class WakeLoop:
                             "rtf": round(result.rtf, 3),
                         }
                     )
+                    if result.text:
+                        self._run_command(result.text)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("ASR failed")
                 self._emit_event(
@@ -518,4 +627,125 @@ class WakeLoop:
         self._asr_thread = threading.Thread(
             target=_worker, name="pawn-asr", daemon=True
         )
+        self._asr_thread.start()
+
+    # ------------------------------------------------------------------ point 2
+
+    def _run_command(self, text: str) -> None:
+        """THINK → intent → SPEAK reply. Runs on the ASR worker thread."""
+        if self.router is None:
+            return
+        self._set_state(State.THINK)
+        result = self.router.handle(text)
+        self._emit_event(result.as_event())
+        self._reply(result.intent, text, result.reply)
+
+    def _reply(self, intent: str, user_text: str, canonical: str, *, kind: str = "reply") -> None:
+        """Speak ``canonical``, reworded by the LLM when phrasing applies.
+
+        Sentences are synthesized and played as they arrive while the model
+        keeps generating; if no valid first sentence comes in time, the
+        canonical text is spoken instead.
+        """
+        if self.phraser is None or not self.phraser.applies(intent) or not canonical:
+            self._say(canonical, kind=kind)
+            return
+        self._set_state(State.SPEAK)
+        stats = PhraseStats()
+        spoken: list[str] = []
+        try:
+            for sentence in self.phraser.sentences(intent, user_text, canonical, stats):
+                spoken.append(sentence)
+                self._say(
+                    sentence,
+                    kind=kind,
+                    full=" ".join(spoken),
+                    seq=len(spoken) - 1,
+                    phrased=True,
+                    first_ms=round(stats.first_ms, 1),
+                )
+        except PhraseFailed as exc:
+            stats.reason = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("reply phrasing failed")
+            stats.reason = f"error: {exc}"
+        if not spoken:
+            logger.info("phrasing fell back to canonical (%s)", stats.reason)
+            self._say(canonical, kind=kind, phrased=False)
+        else:
+            logger.info(
+                "phrased %r → %r (first %.0f ms, total %.0f ms%s)",
+                canonical, " ".join(spoken), stats.first_ms, stats.gen_ms,
+                f", {stats.reason}" if stats.reason else "",
+            )
+
+    def _say(
+        self,
+        text: str,
+        *,
+        kind: str = "reply",
+        full: Optional[str] = None,
+        seq: int = 0,
+        **extra: Any,
+    ) -> None:
+        """Synthesize + play ``text``; the event carries ``full`` (reply so far)."""
+        if not text:
+            return
+        self._set_state(State.SPEAK)
+        payload = {
+            "type": "event",
+            "name": "reply",
+            "kind": kind,
+            "text": full if full is not None else text,
+            "seq": seq,
+            "tts_ms": 0.0,
+            **extra,
+        }
+        if self.tts is None:
+            self._emit_event(payload)
+            return
+        try:
+            speech = self.tts.synthesize(text)
+            payload["tts_ms"] = round(speech.synth_ms, 1)
+            self._emit_event(payload)
+            from pawn_assistant.audio.beep import play_pcm
+
+            play_pcm(speech.pcm, speech.sample_rate, block=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("TTS failed")
+            self._emit_event(payload)
+            self._emit_event({"type": "event", "name": "fault", "message": f"TTS: {exc}"})
+
+    def _maybe_play_alert(self) -> None:
+        """Speak a fired timer only between turns, never over an active one."""
+        if self._state != State.IDLE or self._alerts.empty():
+            return
+        if self._asr_thread is not None and self._asr_thread.is_alive():
+            return
+        try:
+            label = self._alerts.get_nowait()
+        except queue.Empty:
+            return
+        self._set_state(State.SPEAK)
+
+        def _alert() -> None:
+            try:
+                for _ in range(3):
+                    play_beep(
+                        sample_rate=self.settings.sample_rate,
+                        freq_hz=self.settings.beep_freq_hz * 1.5,
+                        duration_ms=180,
+                        volume=self.settings.beep_volume,
+                        block=True,
+                    )
+                self._reply(
+                    ALERT_INTENT,
+                    "",
+                    timer_alert_text(label, self.settings.reply_language),
+                    kind="alert",
+                )
+            finally:
+                self._return_to_idle()
+
+        self._asr_thread = threading.Thread(target=_alert, name="pawn-alert", daemon=True)
         self._asr_thread.start()
