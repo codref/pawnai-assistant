@@ -104,3 +104,61 @@ class HelloMessage(BaseModel):
     sample_rate: int
     status: dict = Field(default_factory=dict)
     gain: Optional[dict] = None
+    commands: list[dict] = Field(default_factory=list)
+    assets: dict = Field(default_factory=dict)  # {"js": [...], "css": [...]} plugin widget files
+    ui: list[dict] = Field(default_factory=list)  # open windows (UiMessage op=open)
+    now_ms: Optional[int] = None  # server clock, for countdown skew
+
+
+# --------------------------------------------------------------------- command plugins / windows
+
+
+class UiMessage(BaseModel):
+    """Server → client: a command opens/updates/closes a HUD window.
+
+    ``update`` carries only the changed ``data`` keys; ``hello.ui`` replays every
+    open window (``op: open``) to late clients.
+    """
+
+    type: Literal["ui"] = "ui"
+    op: Literal["open", "update", "close"]
+    id: str
+    kind: Optional[str] = None  # widget renderer, e.g. "countdown", "radio"
+    command: Optional[str] = None
+    title: Optional[str] = None
+    anchor: Optional[str] = None  # tl | tr | bl | br | center
+    data: dict = Field(default_factory=dict)
+
+
+class CommandInfo(BaseModel):
+    name: str
+    title: str
+    description: str
+    core: bool
+    enabled: bool
+    active: bool
+    intents: list[dict] = Field(default_factory=list)
+
+
+class CommandsMessage(BaseModel):
+    """Server → all clients after a toggle (also ``hello.commands``)."""
+
+    type: Literal["commands"] = "commands"
+    commands: list[CommandInfo]
+
+
+class SetCommandMessage(BaseModel):
+    """Client → server: enable/disable a command plugin (persisted)."""
+
+    type: Literal["set_command"] = "set_command"
+    name: str
+    enabled: bool
+
+
+class UiActionMessage(BaseModel):
+    """Client → server: a widget control was used (routed to the owning command)."""
+
+    type: Literal["ui_action"] = "ui_action"
+    id: str
+    action: str
+    data: dict = Field(default_factory=dict)

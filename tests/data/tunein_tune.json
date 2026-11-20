@@ -1,0 +1,4 @@
+{"head": {"status": "200"}, "body": [
+ {"element": "audio", "url": "http://icecast.unitedradio.it/Virgin.mp3", "reliability": 100, "bitrate": 128, "media_type": "mp3", "is_direct": true},
+ {"element": "audio", "url": "https://icecast.unitedradio.it/Virgin.mp3", "reliability": 100, "bitrate": 128, "media_type": "mp3", "is_direct": true}
+]}

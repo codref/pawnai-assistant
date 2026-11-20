@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>PAWN</title>
   <link rel="stylesheet" href="/static/css/hud.css" />
+  <link rel="stylesheet" href="/static/css/wm.css" />
   <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
 </head>
 <body>
@@ -13,11 +14,14 @@
     <header class="mast">
       <h1 class="brand">PAWN</h1>
       <p class="tag">wake loop · point 2 · commands</p>
+      <button id="modules-btn" class="hud-btn mast-btn" type="button" aria-haspopup="dialog">MODULES<kbd>M</kbd></button>
       <div id="state-chip" class="chip" data-state="IDLE">IDLE</div>
     </header>
 
     <main class="stage">
       <div id="presence" class="presence"></div>
+      <div id="wm-layer" class="wm-layer"></div>
+      <div id="wm-tray" class="wm-tray" aria-label="Minimized windows"></div>
     </main>
 
     <aside class="dock" id="dock">
@@ -84,6 +88,9 @@
   </div>
 
   <script src="/static/js/presence.js"></script>
+  <script src="/static/js/wm.js"></script>
+  <script src="/static/js/widgets.js"></script>
+  <script src="/static/js/commands-panel.js"></script>
   <script src="/static/js/main.js"></script>
 </body>
 </html>

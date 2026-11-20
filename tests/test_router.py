@@ -2,8 +2,8 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from pawn_assistant.commands import CommandContext, CommandRouter
-from pawn_assistant.commands.intents import INTENTS
 from pawn_assistant.commands.llm import build_grammar, build_system_prompt, parse_output
+from pawn_assistant.commands.registry import default_registry
 
 
 @dataclass
@@ -46,7 +46,7 @@ def test_miss_goes_to_llm():
     assert res.source == "llm"
     assert res.intent == "timer.set"
     assert res.reply == "Timer di 3 minuti e 20 secondi avviato."
-    router.ctx.timers.cancel_all()
+    router.registry.shutdown()
 
 
 def test_no_llm_is_unknown():
@@ -68,9 +68,10 @@ def test_intent_event_shape():
 
 def test_grammar_covers_registry():
     grammar = build_grammar()
-    for intent in INTENTS:
+    for intent in default_registry().intents():
         assert f'\\"{intent.name}\\"' in grammar
     assert grammar.count('"\\"minutes\\""') == 1  # only timer.set carries slots
+    assert grammar.count('"\\"station\\""') == 1  # only radio.play
 
 
 def test_prompt_is_static():

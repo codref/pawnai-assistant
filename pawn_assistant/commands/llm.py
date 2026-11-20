@@ -1,7 +1,8 @@
 """Small local LLM (llama.cpp) that maps an utterance to ``{"intent", "slots"}``.
 
-The output is forced by a GBNF grammar built from the intent registry, so the
+The output is forced by a GBNF grammar built from the enabled intents, so the
 model can only emit a known intent name and integer/string slots — no free text.
+Toggling a command rebuilds prompt + grammar (``IntentLLM.set_intents``).
 """
 
 from __future__ import annotations
@@ -12,9 +13,9 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
-from pawn_assistant.commands.intents import INTENTS, SLOT_INT, UNKNOWN, all_slot_names
+from pawn_assistant.commands.base import SLOT_INT, UNKNOWN, Intent
 
 logger = logging.getLogger(__name__)
 
@@ -52,19 +53,38 @@ def resolve_model_path(model: str) -> Path:
 # --------------------------------------------------------------------- prompt / grammar
 
 
-def build_grammar() -> str:
+def _resolve(intents: Optional[Iterable[Intent]]) -> tuple[Intent, ...]:
+    if intents is None:
+        from pawn_assistant.commands.registry import default_registry
+
+        return default_registry().intents()
+    return tuple(intents)
+
+
+def all_slot_names(intents: Optional[Iterable[Intent]] = None) -> dict[str, str]:
+    """Union of every slot across intents (name → type), in registry order."""
+    out: dict[str, str] = {}
+    for intent in _resolve(intents):
+        for name, typ in intent.slots.items():
+            out.setdefault(name, typ)
+    return out
+
+
+def build_grammar(intents: Optional[Iterable[Intent]] = None) -> str:
     """GBNF: one alternative per intent; only that intent's slots, all optional.
 
     ``{"intent": "time.now"}`` / ``{"intent": "timer.set", "minutes": 5}``.
     Omitting unmentioned slots keeps the output to a handful of tokens, and
     slot-less intents cannot hallucinate slots.
     """
+    intents = _resolve(intents)
+    slot_order = all_slot_names(intents)
     alts, rules = [], []
-    for idx, intent in enumerate(INTENTS):
+    for idx, intent in enumerate(intents):
         rule = f"i{idx}"
         name = json.dumps(json.dumps(intent.name))
         parts = [f'"{{" ws "\\"intent\\"" ws ":" ws {name}']
-        for slot in all_slot_names():  # registry order == _example_json order
+        for slot in slot_order:  # registry order == _example_json order
             if slot not in intent.slots:
                 continue
             value = "int" if intent.slots[slot] == SLOT_INT else "str"
@@ -83,16 +103,18 @@ def build_grammar() -> str:
     )
 
 
-def _example_json(intent: str, slots: dict[str, Any]) -> str:
+def _example_json(intent: str, slots: dict[str, Any], slot_order: Sequence[str]) -> str:
     out: dict[str, Any] = {"intent": intent}
-    for slot in all_slot_names():  # registry order == grammar order
+    for slot in slot_order:  # registry order == grammar order
         if slots.get(slot) is not None:
             out[slot] = slots[slot]
     return json.dumps(out, ensure_ascii=False)
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(intents: Optional[Iterable[Intent]] = None) -> str:
     """Static prompt — keep byte-identical across calls so llama.cpp reuses the KV prefix."""
+    intents = _resolve(intents)
+    slot_order = list(all_slot_names(intents))
     lines = [
         "You are the command parser of a voice assistant. The user speaks Italian or English;",
         "the text comes from speech recognition and may contain mistakes.",
@@ -100,15 +122,15 @@ def build_system_prompt() -> str:
         "",
         "Intents:",
     ]
-    for intent in INTENTS:
+    for intent in intents:
         slots = f" (slots: {', '.join(intent.slots)})" if intent.slots else ""
         lines.append(f"- {intent.name}: {intent.description}{slots}")
     lines += ["", "Examples:"]
-    for intent in INTENTS:
+    for intent in intents:
         for utterance, slots in intent.fewshot:
-            lines.append(f"{utterance} => {_example_json(intent.name, slots)}")
+            lines.append(f"{utterance} => {_example_json(intent.name, slots, slot_order)}")
         for example in intent.examples[:2]:
-            lines.append(f"{example} => {_example_json(intent.name, {})}")
+            lines.append(f"{example} => {_example_json(intent.name, {}, slot_order)}")
     return "\n".join(lines)
 
 
@@ -120,14 +142,15 @@ class LLMParse:
     raw: str
 
 
-def parse_output(raw: str) -> tuple[str, dict[str, Any]]:
+def parse_output(raw: str, names: Optional[Iterable[str]] = None) -> tuple[str, dict[str, Any]]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         logger.warning("LLM returned non-JSON: %r", raw)
         return UNKNOWN, {}
     intent = data.pop("intent", UNKNOWN)
-    if intent not in {i.name for i in INTENTS}:
+    known = set(names) if names is not None else {i.name for i in _resolve(None)}
+    if intent not in known:
         intent = UNKNOWN
     slots = {k: v for k, v in data.items() if v is not None}
     return intent, slots
@@ -147,13 +170,16 @@ class IntentLLM:
         n_ctx: int = 1024,  # ~430-token prompt + utterance + short JSON
         # ~11 MB per cached prompt state: intent parse + one per phrasing intent.
         cache_bytes: int = 128 * 1024 * 1024,
+        intents: Optional[Iterable[Intent]] = None,
     ) -> None:
         self.model = model
         self.n_threads = n_threads
         self.idle_unload_s = idle_unload_s
         self.n_ctx = n_ctx
-        self.system_prompt = build_system_prompt()
-        self._grammar_text = build_grammar()
+        self._intents = _resolve(intents)
+        self._names = frozenset(i.name for i in self._intents)
+        self.system_prompt = build_system_prompt(self._intents)
+        self._grammar_text = build_grammar(self._intents)
         self._llm = None
         self._grammar = None
         self._lock = threading.Lock()
@@ -225,6 +251,30 @@ class IntentLLM:
         self._unload_timer = threading.Timer(self.idle_unload_s, _fire)
         self._unload_timer.daemon = True
         self._unload_timer.start()
+
+    def set_intents(self, intents: Iterable[Intent], *, warm: bool = True) -> None:
+        """Swap prompt + grammar after a command was toggled.
+
+        The KV RAM cache keeps the old prefix too, so toggling back is cheap.
+        If the model is resident the new prefix is primed in the background.
+        """
+        intents = tuple(intents)
+        prompt, grammar_text = build_system_prompt(intents), build_grammar(intents)
+        with self._lock:
+            if prompt == self.system_prompt and grammar_text == self._grammar_text:
+                return
+            self._intents = intents
+            self._names = frozenset(i.name for i in intents)
+            self.system_prompt = prompt
+            self._grammar_text = grammar_text
+            if self._llm is not None:
+                from llama_cpp import LlamaGrammar
+
+                self._grammar = LlamaGrammar.from_string(grammar_text, verbose=False)
+            resident = self._llm is not None
+        logger.info("intent LLM prompt rebuilt for %d intents", len(intents))
+        if warm and resident:
+            threading.Thread(target=self.warmup, name="pawn-llm-rewarm", daemon=True).start()
 
     def add_warmup(self, fn: Any) -> None:
         """Extra prefix to prime in ``warmup`` (e.g. the reply-phrasing prompt)."""
@@ -304,6 +354,6 @@ class IntentLLM:
             self._last_used = time.monotonic()
         raw = (out["choices"][0]["message"]["content"] or "").strip()
         infer_ms = (time.perf_counter() - t0) * 1000.0
-        intent, slots = parse_output(raw)
+        intent, slots = parse_output(raw, self._names)
         self._schedule_unload()
         return LLMParse(intent=intent, slots=slots, infer_ms=infer_ms, raw=raw)

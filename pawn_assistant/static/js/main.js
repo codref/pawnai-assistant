@@ -1,4 +1,4 @@
-/* global PawnPresence */
+/* global PawnPresence, PawnWM, PawnWidgets, PawnModules */
 (function () {
   "use strict";
 
@@ -40,6 +40,18 @@
   let gainUnit = "%";
 
   const presence = PawnPresence.mountPresence(document.getElementById("presence"));
+
+  // Command windows: plugins open/update/close them via {"type":"ui"} messages.
+  let clockSkew = 0; // server clock − local clock (ms), from hello.now_ms
+  function send(msg) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  }
+  PawnWM.init({
+    layer: document.getElementById("wm-layer"),
+    tray: document.getElementById("wm-tray"),
+  });
+  const uiHost = PawnWidgets.createHost({ send, skew: () => clockSkew });
+  PawnModules.init({ button: document.getElementById("modules-btn"), send });
   const sparkScores = [];
   const SPARK_N = 80;
   let wakeThreshold = 0.5;
@@ -249,6 +261,18 @@
         els.rate.textContent = `${data.sample_rate} Hz`;
         if (data.status && data.status.state) setState(data.status.state);
         if (data.gain) renderGain(data.gain);
+        if (typeof data.now_ms === "number") clockSkew = data.now_ms - Date.now();
+        uiHost.load(data.assets);
+        uiHost.replay(data.ui || []);
+        PawnModules.setCommands(data.commands || []);
+        return;
+      }
+      if (data.type === "ui") {
+        uiHost.handle(data);
+        return;
+      }
+      if (data.type === "commands") {
+        PawnModules.setCommands(data.commands);
         return;
       }
       if (data.type === "gain") {

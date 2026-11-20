@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_PERSONA_IT = "Sei PAWN, un assistente vocale da HUD: asciutto, preciso, con un filo di ironia."
 DEFAULT_PERSONA_EN = "You are PAWN, a HUD voice assistant: dry, precise, with a hint of irony."
 
-# Pseudo-intent for spoken timer alerts (not in the intent registry).
+# Pseudo-intent for spoken timer alerts (few-shots live in the timer plugin).
 ALERT_INTENT = "timer.alert"
 
 
@@ -100,84 +100,25 @@ MOODS_EN = ("dry", "ironic", "warm", "technical", "terse", "playful", "solemn", 
 _PARTS_IT = ("notte", "mattina", "pomeriggio", "sera")
 _PARTS_EN = ("night", "morning", "afternoon", "evening")
 
-# Few-shots per intent: (user said, fact, mood, now, reply). Only the current
+# Few-shots per intent: (user said, fact, mood, now, reply). Each command
+# plugin declares its own rows (``Command.phrasing``). Only the current
 # intent's examples are sent, as chat turns — a 1.5B model shown every intent's
 # examples at once tends to copy a reply from the wrong one.
 Shot = tuple[str, str, str, str, str]
 
-_FEWSHOT_IT: dict[str, tuple[Shot, ...]] = {
-    "time.now": (
-        ("che ore sono", "Sono le 9 e 10.", "cordiale", "mattina", "Sono le 9 e 10, la mattina è ancora giovane."),
-        ("mi dici l'ora", "Sono le 23 e 47.", "ironico", "sera", "Le 23 e 47. Tardi anche per un HUD."),
-        ("che ora è", "Sono le 15 in punto.", "tecnico", "pomeriggio", "Orologio di sistema: 15 in punto."),
-    ),
-    "date.today": (
-        ("che giorno è", "Oggi è lunedì 3 marzo 2025.", "tecnico", "pomeriggio", "Data corrente: lunedì 3 marzo 2025."),
-        ("quanti ne abbiamo", "Oggi è sabato 12 luglio 2025.", "complice", "mattina", "Siamo a sabato 12 luglio 2025, si respira aria di weekend."),
-        ("che data è", "Oggi è mercoledì primo ottobre 2025.", "conciso", "sera", "Mercoledì primo ottobre 2025."),
-    ),
-    "timer.set": (
-        ("metti un timer di dieci minuti", "Timer di 10 minuti avviato.", "conciso", "sera", "10 minuti, partiti."),
-        ("avvisami tra un'ora", "Timer di un'ora avviato.", "cordiale", "mattina", "D'accordo, ti avviso tra un'ora."),
-        ("timer di 30 secondi", "Timer di 30 secondi avviato.", "ironico", "pomeriggio", "30 secondi. Non sbattere le palpebre."),
-    ),
-    "cancel": (
-        ("annulla il timer", "Timer annullato.", "complice", "pomeriggio", "Timer annullato, facciamo finta di niente."),
-        ("ferma tutto", "2 timer annullati.", "tecnico", "sera", "2 timer annullati, conto alla rovescia azzerato."),
-        ("stop", "Ok, nessun timer attivo.", "asciutto", "mattina", "Niente da fermare, nessun timer attivo."),
-    ),
-    "greeting": (
-        ("ciao come stai", "Ciao. Tutto operativo.", "solenne", "mattina", "Buongiorno. Ogni sistema risponde all'appello."),
-        ("ehi", "Ciao. Tutto operativo.", "pigro", "notte", "Ehi. Sveglio, più o meno."),
-        ("buonasera", "Ciao. Tutto operativo.", "cordiale", "sera", "Buonasera. Qui tutto in ordine."),
-    ),
-    "unknown": (
-        ("che tempo fa domani", "Non ho capito.", "asciutto", "pomeriggio", "Non è roba per me."),
-        ("raccontami una storia", "Non ho capito.", "ironico", "sera", "Storie? Non è il mio reparto."),
-        ("ordina una pizza", "Non ho capito.", "cordiale", "mattina", "Mi dispiace, questo non lo so fare."),
-    ),
-    ALERT_INTENT: (
-        ("-", "Il timer di 5 minuti è scaduto.", "tecnico", "pomeriggio", "Conto alla rovescia di 5 minuti completato."),
-        ("-", "Il timer di un'ora è scaduto.", "complice", "sera", "Ehi, l'ora è passata. Il timer è scaduto."),
-    ),
-}
 
-_FEWSHOT_EN: dict[str, tuple[Shot, ...]] = {
-    "time.now": (
-        ("what time is it", "It's 9:10.", "warm", "morning", "It's 9:10, the morning is still young."),
-        ("what's the time", "It's 23:47.", "ironic", "evening", "23:47. Late, even for a HUD."),
-    ),
-    "date.today": (
-        ("what day is it", "Today is Monday, March 3, 2025.", "technical", "afternoon", "Current date: Monday, March 3, 2025."),
-        ("what's the date", "Today is Saturday, July 12, 2025.", "playful", "morning", "Saturday, July 12, 2025. Weekend mode."),
-    ),
-    "timer.set": (
-        ("set a timer for ten minutes", "Timer for 10 minutes started.", "terse", "evening", "10 minutes, running."),
-        ("timer for 30 seconds", "Timer for 30 seconds started.", "ironic", "afternoon", "30 seconds. Don't blink."),
-    ),
-    "cancel": (
-        ("cancel the timer", "Timer cancelled.", "playful", "afternoon", "Timer cancelled. It never happened."),
-        ("stop", "Okay, no timer running.", "dry", "morning", "Nothing to stop, no timer running."),
-    ),
-    "greeting": (
-        ("hi how are you", "Hello. All systems nominal.", "solemn", "morning", "Good morning. Every system reports for duty."),
-        ("hey", "Hello. All systems nominal.", "laid-back", "night", "Hey. Awake, more or less."),
-    ),
-    "unknown": (
-        ("what's the weather tomorrow", "I didn't understand.", "dry", "afternoon", "Not my department."),
-        ("tell me a story", "I didn't understand.", "ironic", "evening", "Stories? Not my department."),
-    ),
-    ALERT_INTENT: (
-        ("-", "Your 5 minutes timer is done.", "technical", "afternoon", "5 minute countdown complete."),
-    ),
-}
+def _registry(registry: Any = None) -> Any:
+    if registry is not None:
+        return registry
+    from pawn_assistant.commands.registry import default_registry
+
+    return default_registry()
 
 
-def fewshot_turns(intent: str, lang: str = "it") -> list[dict[str, str]]:
+def fewshot_turns(intent: str, lang: str = "it", registry: Any = None) -> list[dict[str, str]]:
     """Chat turns demonstrating ``intent`` (static per intent → cacheable prefix)."""
-    table = _FEWSHOT_IT if lang == "it" else _FEWSHOT_EN
     turns: list[dict[str, str]] = []
-    for said, fact, mood, now, reply in table.get(intent, ()):
+    for said, fact, mood, now, reply in _registry(registry).fewshot_rows(intent, lang):
         turns.append({"role": "user", "content": user_message(intent, said, fact, mood, now)})
         turns.append({"role": "assistant", "content": reply})
     return turns
@@ -339,9 +280,11 @@ class ReplyPhraser:
         *,
         now: Callable[[], datetime] = datetime.now,
         rng: Optional[random.Random] = None,
+        registry: Any = None,
     ) -> None:
         self.llm = llm
         self.settings = settings or PhraseSettings()
+        self.registry = _registry(registry)
         self.system_prompt = build_phrase_prompt(self.settings.persona, self.settings.lang)
         self.now = now
         self.rng = rng or random.Random()
@@ -354,6 +297,8 @@ class ReplyPhraser:
         return mood
 
     def applies(self, intent: str) -> bool:
+        if not self.registry.phrase_allowed(intent):
+            return False
         allowed = self.settings.intents
         return allowed is None or intent in allowed
 
@@ -364,7 +309,7 @@ class ReplyPhraser:
         now = part_of_day(self.now().hour, self.settings.lang)
         return [
             {"role": "system", "content": self.system_prompt},
-            *fewshot_turns(intent, self.settings.lang),
+            *fewshot_turns(intent, self.settings.lang, self.registry),
             {"role": "user", "content": user_message(intent, user_text, canonical, mood, now)},
         ]
 
@@ -374,8 +319,7 @@ class ReplyPhraser:
         A cold prefix costs ~2 s of prefill on 4 cores — most of the first-
         sentence budget. The shared LLM's RAM cache keeps them (~11 MB each).
         """
-        table = _FEWSHOT_IT if self.settings.lang == "it" else _FEWSHOT_EN
-        for intent in table:
+        for intent in self.registry.phrase_intents(self.settings.lang):
             if not self.applies(intent):
                 continue
             for _ in self.llm.stream_chat(

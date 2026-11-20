@@ -14,26 +14,100 @@ transcript ─▶ fast-path ──hit──▶ handler ─▶ canonical ─▶ p
 |-------|--------|----------------|
 | Fast-path: normalise + phrase / regex match | `commands/fastpath.py` | < 5 ms |
 | Intent LLM: Qwen2.5-1.5B-Instruct Q4_K_M, llama.cpp | `commands/llm.py` | p50 ≈ 0.5 s, p95 ≈ 0.85 s |
-| Handler (time, date, timers, …) | `commands/handlers.py` | ~0 |
+| Handler (plugin method) | `commands/builtin/*` | ~0 |
 | Reply phrasing: same Qwen, free text, streamed | `commands/phrasing.py` | first sentence p50 ≈ 0.5–0.8 s, p95 ≈ 1.2 s |
 | Piper `it_IT-paola-medium` | `audio/tts.py` | ~60 ms synth / 2 s audio |
 
 About half of the eval set never touches the LLM.
 
-## Intents
+## Command plugins
 
-Registry in `commands/intents.py` — the single source for fast-path phrases, LLM prompt, few-shots and grammar.
+Every command is a plugin: one `Command` subclass whose decorated methods are the intents. The registry (`commands/registry.py`) builds the fast-path phrase table, the LLM prompt + grammar and the phrasing few-shots from the **enabled** plugins.
 
-| Intent | Slots | Example |
-|--------|-------|---------|
-| `time.now` | — | "che ora è" |
-| `date.today` | — | "che giorno è oggi" |
-| `timer.set` | `hours`, `minutes`, `seconds` | "metti un timer di cinque minuti" |
-| `cancel` | — | "annulla il timer", "stop" |
-| `greeting` | — | "ciao" |
-| `unknown` | — | anything else → "Non ho capito." |
+| Plugin | Intents | Slots | Example |
+|--------|---------|-------|---------|
+| `core` (locked) | `greeting`, `cancel`, `unknown` | — | "ciao", "stop" |
+| `clock` | `time.now`, `date.today` | — | "che ora è" |
+| `timer` | `timer.set` | `hours`, `minutes`, `seconds` | "metti un timer di cinque minuti" |
+| `radio` | `radio.play`, `radio.stop`, `radio.info` | `station` (str) | "metti virgin radio" |
 
-**Adding a command:** add an `Intent` (description, examples, slots, few-shots) and a handler in `HANDLERS`. Prompt and grammar rebuild automatically. Add cases to `tests/data/commands_it.yaml` and run the eval.
+Sources: modules in `pawn_assistant/commands/builtin/`, plus installed packages exposing an entry point in group `pawn_assistant.commands` (a `Command` class or a module).
+
+### Writing one
+
+```python
+# pawn_assistant/commands/builtin/coin.py  (or your own package + entry point)
+import random
+from pawn_assistant.commands.base import Command, intent
+
+
+class CoinCommand(Command):
+    name = "coin"                      # id + YAML key under commands:
+    title = "Coin flip"
+    description = "Heads or tails."
+    phrasing = {"it": {"coin.flip": (  # optional: rows for the reply rewording
+        ("lancia una moneta", "Testa.", "ironico", "sera", "Testa. La sorte ha parlato."),
+    )}}
+
+    @intent("coin.flip", "the user wants to flip a coin",
+            examples=("lancia una moneta", "testa o croce", "flip a coin"),
+            fewshot=(("tira una monetina", {}),))
+    def flip(self, slots, ctx) -> str:
+        return ctx.t("Testa.", "Heads.") if random.random() < 0.5 else ctx.t("Croce.", "Tails.")
+```
+
+`examples` feed the fast-path verbatim; `fewshot` goes into the LLM prompt; `slots` (`SLOT_INT` / `SLOT_STR`) shape the grammar. `phrase=False` on `@intent` speaks the canonical reply verbatim (the guard protects digits and dates, not names). Add eval cases to `tests/data/commands_it.yaml`.
+
+Optional hooks on `Command`:
+
+| Hook | Use |
+|------|-----|
+| `configure(cfg)` | `commands.<name>` from the YAML |
+| `setup(ctx)` | once, with the shared `CommandContext` |
+| `fast_match(norm) → FastMatch` | regex slot extraction before the phrase table (timer durations, radio station) |
+| `is_active()` / `on_cancel(ctx)` | generic "stop": the command named in the text (`cancel_words`), else the latest active one (`mark_active()`), else all active |
+| `on_state(state)` | loop state changes (radio ducking). Called on the capture thread — must not block |
+| `on_ui_action(id, action, data)` | buttons/sliders in the command's windows |
+| `on_disable()` / `shutdown()` | stop what is running |
+
+`ctx` gives `ctx.t(it, en)`, `ctx.now()`, `ctx.announce(text, intent=…, beeps=3)` (spoken alert, queued until the loop is idle), `ctx.ui` (windows, below) and `self.state_get/state_set` (persisted JSON).
+
+### Enable / disable
+
+HUD → **MODULES** (or `M`) toggles a plugin live: fast-path table, LLM grammar + prompt (`IntentLLM.set_intents`, re-warmed in the background; the KV cache keeps the old prefix) and phrasing warmup all follow. Toggles persist in `~/.local/state/pawn-assistant/commands.json` (`commands.state_file`), overriding `commands.disabled` from the YAML. `core` cannot be disabled.
+
+### HUD windows
+
+A plugin opens windows through `ctx.ui`:
+
+```python
+ctx.ui.open("timer:3", "countdown", command="timer", title="TIMER", anchor="tr",
+            data={"label": "5 minuti", "total_s": 300, "due_at_ms": …, "state": "running"})
+ctx.ui.update("timer:3", {"state": "expired"})   # partial data
+ctx.ui.close("timer:3")
+```
+
+and ships the renderer as an asset next to the module (`assets = {"js": ("widget.js",), "css": ("widget.css",)}`, served at `/plugins/<name>/<file>`, loaded by the HUD from `hello.assets`):
+
+```js
+PawnWidgets.register("countdown", {
+  mount(body, data, api) {   // api.action(name, data) → on_ui_action; api.now(); api.setStatus(); api.flash(); api.close()
+    …
+    return { update(data, changed) { … }, unmount() { … } };
+  },
+});
+```
+
+Kinds without a renderer fall back to a key/value list. The window manager (`static/js/wm.js`, `PawnWM.open({...})`) is generic — the MODULES panel uses it too.
+
+## Web radio
+
+`radio` searches TuneIn (`opml.radiotime.com`, JSON render), tunes the first playable hit (geo-blocked stations return a `notcompatible` placeholder → next hit) and plays it with **mpv** over JSON IPC: live volume, ICY now-playing titles. Station details (`Describe.ashx`: slogan, genre, location, FM frequency) fill the window in the background.
+
+- Search hits must match the spoken name (`name_score` ≥ 0.8: numbers must match, "radio"/"fm" count less), else the reply is "Non trovo quella stazione." — TuneIn search hides some stations entirely (BBC Radio 1/2/4/6, RTL 102.5) and would otherwise hand back an unrelated top hit.
+- TuneIn search is not localised and misses some Italian stations; `commands.radio.prefer: [Italian, Italy]` ranks hits by language/location, and `presets` map spoken names to guide ids.
+- Ducking: AWAKE → IDLE at `duck_volume` (80 ms down, `duck_ramp_ms` back up). Not on STIR — the radio itself nudges the wake score and would pump.
+- No AEC: the wake word still has to beat the radio at full volume.
 
 ## LLM details
 
@@ -73,7 +147,7 @@ Fallbacks are guard rejections (e.g. "30 secondi" for 1 min 30 s); the user hear
 
 ## States / events
 
-New states: `THINK` (intent parsing), `SPEAK` (TTS playing). Mic frames are ignored in `BUSY`/`THINK`/`SPEAK` (no AEC yet), and the wake debounce after `SPEAK` covers the speaker tail.
+New states: `THINK` (intent parsing), `SPEAK` (TTS playing). Plugins see every change via `on_state`. Mic frames are ignored in `BUSY`/`THINK`/`SPEAK` (no AEC yet), and the wake debounce after `SPEAK` covers the speaker tail.
 
 ```json
 {"type": "event", "name": "intent", "intent": "timer.set", "slots": {"minutes": 5}, "source": "fastpath", "parse_ms": 0.4}
@@ -86,7 +160,18 @@ Meter adds `llm_resident`, `tts_resident`.
 
 `text` is the reply so far; the HUD replaces the line on `seq > 0`. A fallback reply has `phrased: false`.
 
-Timer alerts queue up and play (3 beeps + speech) only when the loop is `IDLE`, never over an active turn.
+Plugin alerts (`ctx.announce`, e.g. timer expiry) queue up and play (3 beeps + speech) only when the loop is `IDLE`, never over an active turn.
+
+Plugin/window messages:
+
+```json
+{"type": "ui", "op": "open", "id": "radio:main", "kind": "radio", "command": "radio", "title": "RADIO", "anchor": "tl", "data": {"name": "Virgin Radio Italy", "volume": 70, "ducked": false}}
+{"type": "ui", "op": "update", "id": "radio:main", "data": {"now_playing": "Muse - Uprising"}}
+{"type": "ui", "op": "close", "id": "radio:main"}
+{"type": "commands", "commands": [{"name": "radio", "title": "Web radio", "enabled": true, "core": false, "active": true, "intents": [...]}]}
+```
+
+`hello` adds `commands`, `assets`, `ui` (open windows) and `now_ms` (server clock for countdowns). Client → server: `{"type": "set_command", "name": "radio", "enabled": false}`, `{"type": "ui_action", "id": "radio:main", "action": "set_volume", "data": {"value": 40}}` (closing a window by hand sends `action: "close"`).
 
 ## Memory (measured)
 

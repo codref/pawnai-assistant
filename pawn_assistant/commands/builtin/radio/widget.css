@@ -1,0 +1,252 @@
+/* Radio plugin — station card. */
+
+.rd {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.6rem;
+}
+
+.rd-top {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 0.75rem;
+  align-items: start;
+}
+
+.rd-logo {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  background: #061018;
+  border: 1px solid var(--cyan-dim);
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.rd-logo img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  filter: saturate(0.85) contrast(1.05);
+  transition: opacity 200ms ease;
+}
+
+.rd-logo.has-img img {
+  opacity: 1;
+}
+
+.rd-logo.has-img .rd-glyph {
+  display: none;
+}
+
+/* scanline sheen over the logo */
+.rd-logo::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(to bottom, transparent 0 2px, rgba(5, 8, 12, 0.25) 2px 3px);
+  pointer-events: none;
+}
+
+.rd-glyph {
+  font-size: 1.8rem;
+  color: var(--cyan);
+}
+
+.rd-id {
+  min-width: 0;
+}
+
+.rd-name {
+  font-family: "Orbitron", sans-serif;
+  font-weight: 700;
+  font-size: 0.95rem;
+  letter-spacing: 0.08em;
+  color: var(--cyan);
+  text-shadow: 0 0 14px rgba(61, 231, 255, 0.3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rd-slogan {
+  margin-top: 0.15rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rd-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.4rem;
+}
+
+.rd-chip {
+  font-size: 0.64rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 0.05rem 0.4rem;
+  color: var(--text);
+  border: 1px solid #12303a;
+  background: #061018;
+}
+
+.rd-np {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem;
+  background: #061018;
+  border: 1px solid #12303a;
+  border-left: 2px solid var(--speak);
+}
+
+.rd-np-tag {
+  font-size: 0.62rem;
+  letter-spacing: 0.2em;
+  color: var(--speak);
+  flex: none;
+}
+
+.rd-np-view {
+  overflow: hidden;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.rd-np-text {
+  display: inline-block;
+  font-size: 0.78rem;
+  color: var(--text);
+}
+
+.rd-np-view.scroll .rd-np-text {
+  animation: rd-marquee var(--rd-dur, 10s) linear infinite alternate;
+}
+
+@keyframes rd-marquee {
+  0%,
+  12% {
+    transform: translateX(0);
+  }
+  88%,
+  100% {
+    transform: translateX(var(--rd-shift, -100px));
+  }
+}
+
+.rd-eq {
+  display: grid;
+  grid-template-columns: repeat(14, 1fr);
+  align-items: end;
+  gap: 3px;
+  height: 28px;
+}
+
+.rd-eq i {
+  height: 100%;
+  background: linear-gradient(to top, var(--cyan-dim), var(--cyan));
+  transform-origin: bottom;
+  transform: scaleY(0.2);
+  animation: rd-eq 0.7s ease-in-out infinite alternate;
+}
+
+@keyframes rd-eq {
+  0% {
+    transform: scaleY(0.15);
+  }
+  45% {
+    transform: scaleY(0.9);
+  }
+  70% {
+    transform: scaleY(0.4);
+  }
+  100% {
+    transform: scaleY(0.7);
+  }
+}
+
+.rd[data-status="ducked"] .rd-eq i {
+  animation-play-state: paused;
+  background: linear-gradient(to top, #23414b, var(--cyan-dim));
+}
+
+.rd[data-status="error"] .rd-eq i {
+  animation: none;
+  transform: scaleY(0.08);
+  background: var(--fault);
+}
+
+.rd-ctl {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.rd-vol {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex: 1;
+  min-width: 120px;
+  font-size: 0.66rem;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+}
+
+.rd-vol input {
+  flex: 1;
+  min-width: 60px;
+  accent-color: var(--cyan);
+}
+
+.rd-vol output {
+  width: 2ch;
+  text-align: right;
+  color: var(--cyan);
+}
+
+.rd-badge {
+  font-size: 0.64rem;
+  letter-spacing: 0.18em;
+  color: var(--speak);
+}
+
+.rd[data-status="ducked"] .rd-badge {
+  color: var(--think);
+}
+
+.rd[data-status="error"] .rd-badge {
+  color: var(--fault);
+}
+
+.rd-err {
+  font-size: 0.72rem;
+  color: var(--fault);
+}
+
+.rd-err:empty {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rd-eq i,
+  .rd-np-view.scroll .rd-np-text {
+    animation: none;
+  }
+
+  .rd-eq i {
+    transform: scaleY(0.5);
+  }
+}

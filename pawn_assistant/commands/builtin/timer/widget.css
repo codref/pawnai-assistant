@@ -1,0 +1,80 @@
+/* Timer plugin — countdown window. */
+
+.cd {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.cd-digits {
+  font-family: "Orbitron", sans-serif;
+  font-weight: 700;
+  font-size: clamp(2rem, 4.2vw, 2.8rem);
+  letter-spacing: 0.08em;
+  color: var(--cyan);
+  text-shadow: 0 0 18px rgba(61, 231, 255, 0.35);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.cd-label {
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.cd-bar {
+  display: grid;
+  grid-template-columns: repeat(24, 1fr);
+  gap: 2px;
+  height: 8px;
+}
+
+.cd-bar i {
+  background: #0d2630;
+  transform: skewX(-20deg);
+}
+
+.cd-bar i.on {
+  background: var(--cyan);
+  box-shadow: 0 0 6px rgba(61, 231, 255, 0.5);
+}
+
+.cd-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0.2rem;
+}
+
+.cd-state {
+  font-size: 0.68rem;
+  letter-spacing: 0.2em;
+  color: var(--speak);
+}
+
+.cd.low .cd-digits {
+  color: var(--amber);
+  text-shadow: 0 0 18px rgba(255, 176, 32, 0.4);
+}
+
+.cd.low .cd-bar i.on {
+  background: var(--amber);
+  box-shadow: 0 0 6px rgba(255, 176, 32, 0.5);
+}
+
+.cd.expired .cd-digits {
+  color: var(--amber);
+  text-shadow: 0 0 22px rgba(255, 176, 32, 0.55);
+  animation: pulse 0.6s ease-in-out infinite;
+}
+
+.cd.expired .cd-state {
+  color: var(--amber);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cd.expired .cd-digits {
+    animation: none;
+  }
+}

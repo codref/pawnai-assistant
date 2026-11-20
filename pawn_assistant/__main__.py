@@ -270,21 +270,31 @@ def _command_settings(config: Optional[str]):
 
 
 def _build_router(settings, *, use_llm: bool = True):
-    from pawn_assistant.commands import CommandContext, CommandRouter
+    from pawn_assistant.commands import CommandContext, CommandRegistry, CommandRouter
     from pawn_assistant.commands.llm import IntentLLM
 
+    # Same enabled set as `serve` (YAML + HUD toggles), but read-only state.
+    state_path = settings.commands_state_path()
+    registry = CommandRegistry(config=settings.commands, state_path=state_path)
+    registry.state_path = None  # `ask` never writes plugin state
     llm = None
     if use_llm and settings.intent_enabled:
         llm = IntentLLM(
             model=settings.intent_model,
             n_threads=settings.intent_threads,
             idle_unload_s=0,
+            intents=registry.intents(),
         )
     return CommandRouter(
         ctx=CommandContext(lang=settings.reply_language),
         llm=llm,
         fastpath_ratio=settings.intent_fastpath_ratio,
+        registry=registry,
     )
+
+
+def _active_commands(router) -> list[str]:
+    return [c.name for c in router.registry.commands() if c.is_active()]
 
 
 def _run_eval(router, path: Path) -> None:
@@ -309,7 +319,7 @@ def _run_eval(router, path: Path) -> None:
             text, want + (f" {want_slots}" if want_slots else ""), got, res.source,
             f"{res.parse_ms:.0f}", "[green]✓[/]" if good else "[red]✗[/]",
         )
-    router.ctx.timers.cancel_all()
+    router.registry.shutdown()
     console.print(table)
     console.print(f"[bold]accuracy[/] {ok}/{len(cases)} = {100.0 * ok / max(1, len(cases)):.1f}%")
     if llm_ms:
@@ -320,11 +330,12 @@ def _run_eval(router, path: Path) -> None:
         )
 
 
-def _phrase_samples(llm, settings, res, text: str, samples: int) -> str:
+def _phrase_samples(router, settings, res, text: str, samples: int) -> str:
     """Print ``samples`` phrased variants with timings; return the first."""
     from pawn_assistant.commands.phrasing import PhraseSettings, ReplyPhraser
 
-    phraser = ReplyPhraser(llm, PhraseSettings.from_settings(settings))
+    llm = router.llm
+    phraser = ReplyPhraser(llm, PhraseSettings.from_settings(settings), registry=router.registry)
     if not phraser.applies(res.intent):
         console.print(f"[bold green]PAWN:[/] {res.reply}  [dim](phrasing off for {res.intent})[/]")
         return res.reply
@@ -393,7 +404,7 @@ def ask(
     reply = res.reply
     use_phrase = settings.phrase_enabled if phrase is None else phrase
     if use_phrase and router.llm is not None and res.reply:
-        reply = _phrase_samples(router.llm, settings, res, text, max(1, samples))
+        reply = _phrase_samples(router, settings, res, text, max(1, samples))
     else:
         console.print(f"[bold green]PAWN:[/] {res.reply}")
     if speak and settings.tts_enabled and reply:
@@ -408,9 +419,17 @@ def ask(
         )
         speech = tts.speak(reply)
         console.print(f"[dim]tts {speech.synth_ms:.0f} ms for {speech.duration_ms:.0f} ms audio[/]")
-    if router.ctx.timers.active:
-        console.print("[dim]timer started — it only fires while `serve` is running[/]")
-        router.ctx.timers.cancel_all()
+    active = _active_commands(router)
+    if "radio" in active:
+        console.print("[dim]radio playing — Ctrl+C to stop[/]")
+        try:
+            while "radio" in _active_commands(router):
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+    elif active:
+        console.print(f"[dim]{', '.join(active)} started — it only runs while `serve` is running[/]")
+    router.registry.shutdown()
 
 
 @app.command("say")

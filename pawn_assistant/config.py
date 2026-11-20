@@ -110,9 +110,24 @@ class Settings:
     # "all" or a list of intent names (timer.alert = spoken timer alerts).
     phrase_intents: Any = "all"
 
+    # Command plugins: raw ``commands:`` YAML section — ``disabled: [...]``,
+    # ``state_file``, plus one sub-mapping per plugin (e.g. ``radio: {...}``).
+    commands: dict = field(default_factory=dict)
+
     # Path the settings were loaded from (informational).
     config_path: Optional[str] = None
     extra: dict = field(default_factory=dict)
+
+    def commands_state_path(self) -> Optional[Path]:
+        """Runtime toggles + plugin state (JSON). ``state_file: null`` disables."""
+        raw = self.commands.get("state_file", _MISSING) if isinstance(self.commands, dict) else _MISSING
+        if raw is None or (isinstance(raw, str) and raw.strip().lower() in ("", "none", "null", "off")):
+            return None
+        if raw is _MISSING:
+            from pawn_assistant.commands.base import default_state_dir
+
+            return default_state_dir() / "commands.json"
+        return Path(str(raw)).expanduser()
 
     @property
     def frame_ms(self) -> float:
@@ -211,6 +226,9 @@ def _flatten_yaml(data: Mapping[str, Any]) -> dict[str, Any]:
     for keys, field_name in mapping.items():
         if _dig(data, *keys, default=_MISSING) is not _MISSING:
             out[field_name] = _dig(data, *keys)
+
+    if isinstance(data.get("commands"), Mapping):
+        out["commands"] = dict(data["commands"])
 
     # Flat keys also accepted for convenience.
     valid = {f.name for f in fields(Settings)} - {"extra", "config_path"}

@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -109,6 +110,10 @@ def create_app(settings: Settings, wake_loop: Optional[WakeLoop] = None) -> Fast
             "sample_rate": settings.sample_rate,
             "status": wl.snapshot_status(),
             "gain": await asyncio.to_thread(wl.gain.state),
+            "commands": wl.commands.describe(),
+            "assets": wl.commands.assets(),
+            "ui": wl.ctx.ui.snapshot(),
+            "now_ms": round(time.time() * 1000),
         }
         await ws.send_text(json.dumps(hello))
         try:
@@ -125,10 +130,29 @@ def create_app(settings: Settings, wake_loop: Optional[WakeLoop] = None) -> Fast
                         continue
                     state = await asyncio.to_thread(wl.gain.set, value)
                     await hub._broadcast({"type": "gain", **state})
+                elif isinstance(msg, dict) and msg.get("type") == "set_command":
+                    name = str(msg.get("name") or "")
+                    enabled = bool(msg.get("enabled"))
+                    await asyncio.to_thread(wl.set_command_enabled, name, enabled)
+                    await hub._broadcast({"type": "commands", "commands": wl.commands.describe()})
+                elif isinstance(msg, dict) and msg.get("type") == "ui_action":
+                    wid = str(msg.get("id") or "")
+                    action = str(msg.get("action") or "")
+                    data = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+                    if wid and action:
+                        await asyncio.to_thread(wl.ui_action, wid, action, data)
         except WebSocketDisconnect:
             pass
         finally:
             await hub.disconnect(ws)
+
+    @app.get("/plugins/{command}/{path:path}")
+    async def plugin_asset(command: str, path: str) -> FileResponse:
+        wl: WakeLoop = app.state.pawn["loop"]
+        target = wl.commands.asset_path(command, path)
+        if target is None:
+            raise HTTPException(status_code=404)
+        return FileResponse(target, headers={"Cache-Control": "no-cache"})
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     return app

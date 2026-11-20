@@ -114,7 +114,31 @@ phrase:
   # Seconds to wait for the first spoken sentence before falling back.
   first_sentence_timeout_s: 2.5
   # all | list of intents, e.g. [greeting, unknown, timer.alert]
+  # (radio.* replies are never reworded: the guard can't protect station names)
   intents: all
+
+commands:
+  # Command plugins switched off by default (HUD → MODULES toggles override
+  # this and are saved in state_file). Core cannot be disabled.
+  disabled: []
+  # Runtime toggles + plugin state (last radio station, volume). null = off.
+  # state_file: ~/.local/state/pawn-assistant/commands.json
+  radio:
+    # Spoken name → TuneIn guide id (the "s…" id in a tunein.com station URL).
+    # Use these for stations TuneIn search ranks badly or doesn't list.
+    # A spoken name is only played if a search hit's name matches it (numbers
+    # included), so stations missing from TuneIn search need a preset.
+    presets:
+      virgin: s69185
+      radio 105: s16526
+      bbc radio 2: s24940   # hidden from TuneIn search
+    # Played by "accendi la radio" before any station was played.
+    default_station: virgin
+    # Rank search hits whose language/location contain one of these first.
+    prefer: [Italian, Italy]
+    volume: 70        # mpv volume 0–100
+    duck_volume: 12   # while PAWN listens / thinks / speaks
+    duck_ramp_ms: 300
 
 beep:
   freq_hz: 880.0

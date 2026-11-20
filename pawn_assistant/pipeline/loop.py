@@ -15,11 +15,10 @@ import psutil
 
 from pawn_assistant.audio.beep import play_beep
 from pawn_assistant.audio.tts import PiperTTS
-from pawn_assistant.commands import CommandContext, CommandRouter, TimerManager
-from pawn_assistant.commands.handlers import timer_alert_text
+from pawn_assistant.commands import CommandContext, CommandRegistry, CommandRouter
+from pawn_assistant.commands.base import Announcement
 from pawn_assistant.commands.llm import IntentLLM
 from pawn_assistant.commands.phrasing import (
-    ALERT_INTENT,
     PhraseFailed,
     PhraseSettings,
     PhraseStats,
@@ -93,8 +92,15 @@ class WakeLoop:
             initial_prompt=settings.asr_initial_prompt,
             vad_filter=settings.asr_vad_filter,
         )
-        # Point 2 — commands + spoken replies.
-        self._alerts: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+        # Point 2 — command plugins + spoken replies.
+        self.ctx = CommandContext(lang=settings.reply_language)
+        self.ctx.ui.emit = self._emit_event
+        self._alerts = self.ctx.alerts
+        self.commands = CommandRegistry(
+            config=settings.commands,
+            state_path=settings.commands_state_path(),
+        )
+        self.commands.setup(self.ctx)
         self.llm: Optional[IntentLLM] = None
         self.router: Optional[CommandRouter] = None
         if settings.intent_enabled:
@@ -102,18 +108,21 @@ class WakeLoop:
                 model=settings.intent_model,
                 n_threads=settings.intent_threads,
                 idle_unload_s=settings.intent_idle_unload_s,
+                intents=self.commands.intents(),
             )
             self.router = CommandRouter(
-                ctx=CommandContext(
-                    lang=settings.reply_language,
-                    timers=TimerManager(on_fire=self._alerts.put),
-                ),
+                ctx=self.ctx,
                 llm=self.llm,
                 fastpath_ratio=settings.intent_fastpath_ratio,
+                registry=self.commands,
             )
+            llm = self.llm
+            self.commands.add_listener(lambda: llm.set_intents(self.commands.intents()))
         self.phraser: Optional[ReplyPhraser] = None
         if self.llm is not None and settings.phrase_enabled:
-            self.phraser = ReplyPhraser(self.llm, PhraseSettings.from_settings(settings))
+            self.phraser = ReplyPhraser(
+                self.llm, PhraseSettings.from_settings(settings), registry=self.commands
+            )
             self.llm.add_warmup(self.phraser.warmup)
         self.tts: Optional[PiperTTS] = None
         if settings.tts_enabled:
@@ -228,6 +237,15 @@ class WakeLoop:
         if self._asr_thread and self._asr_thread.is_alive():
             self._asr_thread.join(timeout=5.0)
         self.capture.stop()
+        self.commands.shutdown()
+
+    # ------------------------------------------------------------------ commands API (server)
+
+    def set_command_enabled(self, name: str, enabled: bool) -> bool:
+        return self.commands.set_enabled(name, enabled)
+
+    def ui_action(self, widget_id: str, action: str, data: Optional[dict[str, Any]] = None) -> bool:
+        return self.commands.ui_action(widget_id, action, data)
 
     def _rss_mb(self) -> float:
         try:
@@ -250,6 +268,9 @@ class WakeLoop:
                 "since_ms": 0,
             }
         )
+        commands = getattr(self, "commands", None)
+        if commands is not None:
+            commands.on_state(state.value)  # e.g. radio ducking; hooks must not block
 
     def _emit_event(self, payload: dict[str, Any]) -> None:
         try:
@@ -717,20 +738,20 @@ class WakeLoop:
             self._emit_event({"type": "event", "name": "fault", "message": f"TTS: {exc}"})
 
     def _maybe_play_alert(self) -> None:
-        """Speak a fired timer only between turns, never over an active one."""
+        """Speak a queued plugin alert only between turns, never over an active one."""
         if self._state != State.IDLE or self._alerts.empty():
             return
         if self._asr_thread is not None and self._asr_thread.is_alive():
             return
         try:
-            label = self._alerts.get_nowait()
+            alert: Announcement = self._alerts.get_nowait()
         except queue.Empty:
             return
         self._set_state(State.SPEAK)
 
         def _alert() -> None:
             try:
-                for _ in range(3):
+                for _ in range(max(0, alert.beeps)):
                     play_beep(
                         sample_rate=self.settings.sample_rate,
                         freq_hz=self.settings.beep_freq_hz * 1.5,
@@ -738,12 +759,7 @@ class WakeLoop:
                         volume=self.settings.beep_volume,
                         block=True,
                     )
-                self._reply(
-                    ALERT_INTENT,
-                    "",
-                    timer_alert_text(label, self.settings.reply_language),
-                    kind="alert",
-                )
+                self._reply(alert.intent, "", alert.text, kind="alert")
             finally:
                 self._return_to_idle()
 

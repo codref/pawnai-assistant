@@ -53,7 +53,7 @@ pawn-assistant = "pawn_assistant.__main__:main"
 include = ["pawn_assistant*"]
 
 [tool.setuptools.package-data]
-pawn_assistant = ["static/**/*"]
+pawn_assistant = ["static/**/*", "commands/builtin/**/*.js", "commands/builtin/**/*.css"]
 
 [tool.ruff]
 line-length = 100

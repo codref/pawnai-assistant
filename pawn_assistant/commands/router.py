@@ -7,9 +7,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
+from pawn_assistant.commands.base import UNKNOWN, CommandContext
 from pawn_assistant.commands.fastpath import FastPath
-from pawn_assistant.commands.handlers import HANDLERS, CommandContext
-from pawn_assistant.commands.intents import UNKNOWN
+from pawn_assistant.commands.registry import CommandRegistry
+from pawn_assistant.commands.text import normalize, strip_fillers
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +48,16 @@ class CommandRouter:
         ctx: Optional[CommandContext] = None,
         llm: Optional[IntentParser] = None,
         fastpath_ratio: float = 0.85,
+        registry: Optional[CommandRegistry] = None,
     ) -> None:
         self.ctx = ctx or CommandContext()
+        if registry is None:
+            registry = self.ctx.registry or CommandRegistry(entry_points=False)
+        self.registry = registry
+        if self.ctx.registry is not registry:
+            registry.setup(self.ctx)
         self.llm = llm
-        self.fastpath = FastPath(min_ratio=fastpath_ratio)
+        self.fastpath = FastPath(registry, min_ratio=fastpath_ratio)
 
     def classify(self, text: str) -> CommandResult:
         t0 = time.perf_counter()
@@ -85,12 +92,19 @@ class CommandRouter:
 
     def handle(self, text: str) -> CommandResult:
         result = self.classify(text)
-        handler = HANDLERS.get(result.intent, HANDLERS[UNKNOWN])
+        handler = self.registry.handler_for(result.intent)
+        if handler is None:  # disabled meanwhile, or a stale LLM answer
+            result.intent, result.slots = UNKNOWN, {}
+            handler = self.registry.handler_for(UNKNOWN)
+        assert handler is not None
+        self.ctx.utterance = text
+        self.ctx.norm = strip_fillers(normalize(text))
         try:
             result.reply = handler(result.slots, self.ctx)
         except Exception:  # noqa: BLE001
             logger.exception("handler %s failed", result.intent)
-            result.reply = HANDLERS[UNKNOWN]({}, self.ctx)
+            fallback = self.registry.handler_for(UNKNOWN)
+            result.reply = fallback({}, self.ctx) if fallback else ""
         logger.info(
             "command %r → %s %s via %s (%.0f ms) → %r",
             text, result.intent, result.slots, result.source, result.parse_ms, result.reply,

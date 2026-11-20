@@ -1,0 +1,6 @@
+{"head": {"status": "200"}, "body": [
+ {"element": "station", "guide_id": "s69185", "name": "Virgin Radio Italy", "slogan": "Style Rock",
+  "logo": "http://cdn-profiles.tunein.com/s69185/images/logoq.png", "location": "Lombardy", "language": "Italian",
+  "genre_name": "Rock", "band": "FM", "frequency": "104.5", "url": "https://www.virginradio.it",
+  "current_song": null, "current_artist": null}
+]}

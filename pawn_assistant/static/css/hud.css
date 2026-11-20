@@ -327,7 +327,7 @@ body {
 
 @media (max-width: 900px) {
   .frame {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
       "mast"
       "stage"
@@ -339,5 +339,10 @@ body {
 
   .stage {
     min-height: 280px;
+  }
+
+  .mast {
+    flex-wrap: wrap;
+    row-gap: 0.5rem;
   }
 }

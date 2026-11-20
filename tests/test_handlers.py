@@ -2,15 +2,17 @@ from datetime import datetime
 
 import pytest
 
-from pawn_assistant.commands.handlers import (
-    CommandContext,
-    TimerManager,
-    format_date,
-    format_duration,
-    format_time,
-    handle_cancel,
-    handle_timer_set,
-)
+from pawn_assistant.commands import CommandContext, CommandRegistry
+from pawn_assistant.commands.builtin.clock import format_date, format_time
+from pawn_assistant.commands.builtin.core import CoreCommand
+from pawn_assistant.commands.builtin.timer import TimerCommand, TimerManager, format_duration
+
+
+def _timer_ctx():
+    ctx = CommandContext()
+    reg = CommandRegistry([CoreCommand, TimerCommand])
+    reg.setup(ctx)
+    return ctx, reg.get("timer"), reg.get("core")
 
 
 @pytest.mark.parametrize(
@@ -45,21 +47,21 @@ def test_format_duration():
 
 
 def test_timer_set_and_cancel():
-    fired = []
-    ctx = CommandContext(timers=TimerManager(on_fire=fired.append))
-    assert handle_timer_set({"minutes": 5}, ctx) == "Timer di 5 minuti avviato."
-    assert ctx.timers.active == 1
-    assert handle_cancel({}, ctx) == "Timer annullato."
-    assert ctx.timers.active == 0
-    assert handle_cancel({}, ctx) == "Ok, nessun timer attivo."
-    assert fired == []
+    ctx, timer, core = _timer_ctx()
+    assert timer.set_timer({"minutes": 5}, ctx) == "Timer di 5 minuti avviato."
+    assert timer.timers.active == 1
+    assert core.cancel({}, ctx) == "Timer annullato."
+    assert timer.timers.active == 0
+    assert core.cancel({}, ctx) == "Ok, non c'è niente da fermare."
+    ctx.norm = "annulla il timer"
+    assert core.cancel({}, ctx) == "Ok, nessun timer attivo."
 
 
 def test_timer_rejects_bad_durations():
-    ctx = CommandContext()
-    assert "durata" in handle_timer_set({}, ctx)
-    assert "massimo" in handle_timer_set({"hours": 30}, ctx)
-    assert ctx.timers.active == 0
+    ctx, timer, _ = _timer_ctx()
+    assert "durata" in timer.set_timer({}, ctx)
+    assert "massimo" in timer.set_timer({"hours": 30}, ctx)
+    assert timer.timers.active == 0
 
 
 def test_timer_fires():
@@ -68,7 +70,7 @@ def test_timer_fires():
     done = threading.Event()
     labels = []
 
-    def on_fire(label):
+    def on_fire(tid, label):
         labels.append(label)
         done.set()
 

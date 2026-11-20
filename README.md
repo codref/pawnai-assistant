@@ -10,6 +10,7 @@ Point 2 adds local **command words**: the transcript goes through a fast phrase 
 - **Python 3.11** (openWakeWord’s `tflite-runtime` has no cp312 wheels; `.python-version` pins 3.11)
 - Mic access
 - ~2.5 GB free disk for Whisper, the intent GGUF and Piper voice on first run
+- `mpv` for the web-radio command (`pacman -S mpv` / `apt install mpv`); everything else works without it
 
 Target hardware: CPU laptop (i5 / 8 GB). Do not co-locate pyannote or a 4B Ollama model in this process.
 
@@ -45,16 +46,21 @@ Copy [`pawn-assistant.example.yaml`](pawn-assistant.example.yaml) → `pawn-assi
 
 ## Commands
 
-Say the wake word, then e.g. “che ora è”, “che giorno è oggi”, “metti un timer di cinque minuti”, “annulla il timer”. Test without a mic:
+Say the wake word, then e.g. “che ora è”, “che giorno è oggi”, “metti un timer di cinque minuti”, “annulla il timer”, “metti virgin radio”, “cosa sta suonando”, “spegni la radio”. Test without a mic:
 
 ```bash
 pawn-assistant ask "che ore sono"                     # intent + reply, spoken
 pawn-assistant ask --no-speak "fra due minuti dimmi che la pasta è pronta"
 pawn-assistant ask --eval tests/data/commands_it.yaml # accuracy + latency
+pawn-assistant ask --no-speak "metti radio 105"       # plays until Ctrl+C
 pawn-assistant say "Sono le 14 e 35."
 ```
 
-Configure under `intent:` / `tts:` in the YAML. Add a command in `pawn_assistant/commands/intents.py` + `handlers.py` — see [`draft/02-commands.md`](draft/02-commands.md).
+Commands are **plugins** (`pawn_assistant/commands/builtin/`: core, clock, timer, radio — or any installed package with a `pawn_assistant.commands` entry point). Toggle them live from the HUD (**MODULES** button or `M`); toggles persist in `~/.local/state/pawn-assistant/commands.json`, defaults come from `commands.disabled` in the YAML. Writing a command: [`draft/02-commands.md`](draft/02-commands.md).
+
+### Web radio
+
+Stations come from TuneIn and play through `mpv` (never through the capture device). Configure under `commands.radio` — presets for stations TuneIn search ranks badly, a default for “accendi la radio”, volumes. The radio is **ducked** from wake until PAWN is idle again; with no echo cancellation the wake word still has to be heard over the radio at its normal volume.
 
 ## Choosing a voice
 
@@ -125,6 +131,7 @@ pawn-assistant serve --device 0   # sounddevice index from list-devices
 
 - **PAWN** presence (Phaser) reacts to state / wake score / level.
 - HTML debug dock: dBFS, wake sparkline, VAD, silence, Whisper resident flag, RSS, transcript log.
+- Window layer over the stage: commands open live windows (timer countdown, radio station card). Drag by the title bar, resize from the corner, minimize to the tray, `Esc` closes; positions are remembered per window kind. `M` opens the MODULES manager.
 - Reloading the tab reconnects the WebSocket; the mic and models stay in the Python process.
 
 ## Architecture

@@ -51,5 +51,15 @@
 - {text: "Raccontami una barzelletta.", intent: unknown}
 - {text: "Accendi la luce in cucina.", intent: unknown}
 - {text: "Chi ha vinto la partita ieri?", intent: unknown}
-- {text: "Metti un po' di musica.", intent: unknown}
 - {text: "Sottotitoli a cura di", intent: unknown}
+
+# radio.play / radio.stop / radio.info
+- {text: "Metti Virgin Radio.", intent: radio.play, slots: {station: virgin radio}}
+- {text: "Sintonizzati su Radio 105.", intent: radio.play, slots: {station: radio 105}}
+- {text: "Accendi la radio.", intent: radio.play}
+- {text: "Metti un po' di musica.", intent: radio.play}
+- {text: "Mi fai sentire un po' di musica?", intent: radio.play}
+- {text: "Spegni la radio.", intent: radio.stop}
+- {text: "Basta musica.", intent: radio.stop}
+- {text: "Cosa sta suonando?", intent: radio.info}
+- {text: "Che canzone è questa?", intent: radio.info}

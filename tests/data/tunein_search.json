@@ -1,0 +1,10 @@
+{"head": {"title": "Search Results: virgin radio", "status": "200"}, "body": [
+ {"element": "outline", "type": "link", "text": "Virgin Radio Podcasts", "URL": "http://opml.radiotime.com/Browse.ashx?c=pbrowse", "item": "show"},
+ {"element": "outline", "type": "audio", "text": "Virgin Radio Legends", "URL": "http://opml.radiotime.com/Tune.ashx?id=s307295",
+  "bitrate": "128", "reliability": "99", "guide_id": "s307295", "subtext": "Classic rock", "formats": "mp3",
+  "item": "station", "image": "http://cdn-profiles.tunein.com/s307295/images/logoq.png", "current_track": "Queen - Bohemian Rhapsody"},
+ {"element": "outline", "type": "audio", "text": "Virgin Radio Italy", "URL": "http://opml.radiotime.com/Tune.ashx?id=s69185",
+  "bitrate": "128", "reliability": "100", "guide_id": "s69185", "subtext": "Style Rock", "formats": "mp3",
+  "item": "station", "image": "http://cdn-profiles.tunein.com/s69185/images/logoq.png"},
+ {"element": "outline", "type": "audio", "text": "Artist: Virgin", "guide_id": "m12345", "item": "topic"}
+]}
