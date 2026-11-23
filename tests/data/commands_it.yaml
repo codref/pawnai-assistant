@@ -63,3 +63,11 @@
 - {text: "Basta musica.", intent: radio.stop}
 - {text: "Cosa sta suonando?", intent: radio.info}
 - {text: "Che canzone è questa?", intent: radio.info}
+
+# pawn.start / pawn.unlock (outside a conversation)
+- {text: "Pawn, iniziamo una conversazione.", intent: pawn.start}
+- {text: "Parliamo un po'.", intent: pawn.start}
+- {text: "Facciamo una chiacchierata?", intent: pawn.start}
+- {text: "Let's start a conversation.", intent: pawn.start}
+- {text: "Sblocca le sessioni.", intent: pawn.unlock}
+- {text: "Unlock the sessions skills.", intent: pawn.unlock}

@@ -127,6 +127,11 @@ class CommandContext:
     utterance: str = ""  # raw text of the command being handled
     norm: str = ""  # normalised text (fillers stripped)
     last_active: str = ""  # command that most recently started something
+    # Conversation mode: the command that "holds the floor" receives every
+    # utterance via ``Command.converse`` (bar its own intents and an exact
+    # "stop"), and the loop re-opens the mic after each reply.
+    floor: Optional[str] = None
+    floor_listen_ms: float = 8000.0  # follow-up listen window before on_floor_timeout
 
     def t(self, it: str, en: str) -> str:
         return it if self.lang == "it" else en
@@ -229,6 +234,19 @@ class Command:
 
     def on_ui_action(self, widget_id: str, action: str, data: dict[str, Any]) -> None:
         """A button/slider in one of this command's widgets was used."""
+
+    def converse(self, text: str, ctx: CommandContext) -> str:
+        """Floor holder only: handle a free-form utterance, return the reply."""
+        return ""
+
+    def on_floor_timeout(self, ctx: CommandContext) -> None:
+        """Floor holder only: nobody spoke in the follow-up window.
+
+        Release ``ctx.floor`` to end the conversation (announce a goodbye if
+        you like), or keep it to pause until the next wake word.
+        """
+        if ctx.floor == self.name:
+            ctx.floor = None
 
     def on_disable(self) -> None:
         """The user switched the command off: stop anything running."""

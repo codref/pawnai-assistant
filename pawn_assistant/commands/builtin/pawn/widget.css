@@ -1,0 +1,144 @@
+/* Pawn plugin — conversation transcript + unlock keypad. */
+
+.pc {
+  display: grid;
+  gap: 0.5rem;
+  min-width: 260px;
+}
+
+.pc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.pc-badge {
+  font-size: 0.62rem;
+  letter-spacing: 0.2em;
+  padding: 0.15rem 0.45rem;
+  border: 1px solid var(--cyan-dim);
+  color: var(--muted);
+}
+
+.pc.unlocked .pc-badge {
+  border-color: var(--amber);
+  color: var(--amber);
+  box-shadow: 0 0 10px rgba(255, 176, 32, 0.35);
+}
+
+.pc-status {
+  font-size: 0.66rem;
+  letter-spacing: 0.12em;
+  color: var(--think);
+  text-transform: uppercase;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+
+.pc-log {
+  display: grid;
+  gap: 0.35rem;
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.pc-turn {
+  display: grid;
+  grid-template-columns: 3.2rem 1fr;
+  gap: 0.4rem;
+}
+
+.pc-turn b {
+  font-size: 0.6rem;
+  letter-spacing: 0.18em;
+  padding-top: 0.15rem;
+  color: var(--muted);
+}
+
+.pc-pawn span {
+  color: var(--speak);
+}
+
+.pc-you span {
+  color: var(--text);
+}
+
+/* ------------------------------------------------------------------ keypad */
+
+.kp {
+  display: grid;
+  gap: 0.6rem;
+  justify-items: center;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.kp-display {
+  display: flex;
+  gap: 0.5rem;
+  min-height: 1.2rem;
+  align-items: center;
+}
+
+.kp-display i {
+  width: 0.85rem;
+  height: 0.85rem;
+  border: 1px solid var(--cyan-dim);
+  transform: rotate(45deg);
+}
+
+.kp-display i.on {
+  background: var(--cyan);
+  box-shadow: 0 0 8px rgba(61, 231, 255, 0.6);
+}
+
+.kp-msg {
+  font-size: 0.64rem;
+  letter-spacing: 0.22em;
+  color: var(--muted);
+}
+
+.kp-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 4.2rem);
+  gap: 0.45rem;
+}
+
+.kp-key {
+  height: 3.4rem;
+  font-family: "Orbitron", sans-serif;
+  font-size: 1.25rem;
+  touch-action: manipulation;
+}
+
+.kp-ok {
+  color: var(--speak);
+  border-color: var(--speak);
+}
+
+.kp.wrong {
+  animation: kp-shake 0.38s ease;
+}
+
+.kp.wrong .kp-msg,
+.kp.locked .kp-msg {
+  color: var(--fault);
+}
+
+.kp.locked .kp-key {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+@keyframes kp-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-8px); }
+  40% { transform: translateX(8px); }
+  60% { transform: translateX(-5px); }
+  80% { transform: translateX(5px); }
+}

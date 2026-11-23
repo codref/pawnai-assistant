@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from enum import Enum
@@ -61,6 +62,7 @@ def _dbfs(samples: np.ndarray) -> tuple[float, float]:
 
 # States in which the mic is ignored (worker thread owns the turn).
 _BUSY_STATES = (State.BUSY, State.THINK, State.SPEAK)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
 
 
 class WakeLoop:
@@ -155,6 +157,8 @@ class WakeLoop:
         self._speech_run_ms = 0.0
         self._speech_total_ms = 0.0
         self._listen_since = 0.0
+        self._listen_wait_ms = float(settings.speech_wait_ms)
+        self._followup = False  # LISTEN opened by a floor holder, not the wake word
         self._utterance: list[np.ndarray] = []
         self._last_rms = -120.0
         self._last_peak = -120.0
@@ -321,6 +325,13 @@ class WakeLoop:
         return peak_db >= self.settings.energy_speech_db
 
     def _return_to_idle(self, *, debounce_ms: Optional[float] = None) -> None:
+        self._reset_turn(debounce_ms=debounce_ms)
+        self._set_state(State.IDLE)
+
+    def _reset_turn(self, *, debounce_ms: Optional[float] = None) -> None:
+        """Clear per-utterance state and audio buffers (no state change)."""
+        self._followup = False
+        self._listen_wait_ms = float(self.settings.speech_wait_ms)
         self._utterance = []
         self._silence_ms = 0.0
         self._heard_speech = False
@@ -337,7 +348,6 @@ class WakeLoop:
             self.settings.wake_debounce_ms if debounce_ms is None else debounce_ms
         )
         self._wake_mute_until = time.monotonic() + (wait / 1000.0)
-        self._set_state(State.IDLE)
 
     def _utt_audio_16k(self) -> np.ndarray:
         """Prefer native-rate capture (no callback drops), resample once for ASR."""
@@ -462,7 +472,10 @@ class WakeLoop:
                 self._silence_ms = 0.0
                 self._set_state(State.LISTEN)
 
-            if not self._heard_speech and utterance_ms >= self.settings.speech_wait_ms:
+            if not self._heard_speech and utterance_ms >= self._listen_wait_ms:
+                if self._followup:
+                    self._on_followup_timeout()
+                    return
                 logger.info("no speech after wake — back to idle")
                 if self.debug is not None:
                     audio = self._utt_audio_16k()
@@ -643,7 +656,7 @@ class WakeLoop:
                     {"type": "event", "name": "fault", "message": f"ASR: {exc}"}
                 )
             finally:
-                self._return_to_idle()
+                self._after_turn()
 
         self._asr_thread = threading.Thread(
             target=_worker, name="pawn-asr", daemon=True
@@ -659,7 +672,10 @@ class WakeLoop:
         self._set_state(State.THINK)
         result = self.router.handle(text)
         self._emit_event(result.as_event())
-        self._reply(result.intent, text, result.reply)
+        if result.source == "floor":
+            self._say_sentences(result.reply)
+        else:
+            self._reply(result.intent, text, result.reply)
 
     def _reply(self, intent: str, user_text: str, canonical: str, *, kind: str = "reply") -> None:
         """Speak ``canonical``, reworded by the LLM when phrasing applies.
@@ -737,12 +753,70 @@ class WakeLoop:
             self._emit_event(payload)
             self._emit_event({"type": "event", "name": "fault", "message": f"TTS: {exc}"})
 
+    def _say_sentences(self, text: str, *, kind: str = "reply") -> None:
+        """Speak a remote (already concise) answer one sentence at a time."""
+        parts = [p for p in _SENTENCE_SPLIT.split((text or "").strip()) if p.strip()]
+        spoken: list[str] = []
+        for part in parts:
+            spoken.append(part.strip())
+            self._say(part.strip(), kind=kind, full=" ".join(spoken), seq=len(spoken) - 1)
+
+    # ------------------------------------------------------------ conversation
+
+    def _floor_active(self) -> bool:
+        return bool(self.router is not None and self.router.floor_owner() is not None)
+
+    def _after_turn(self) -> None:
+        """End of a spoken turn: keep the mic open while a command holds the floor."""
+        if not self._floor_active() or self._stop.is_set():
+            self._return_to_idle()
+            return
+        self._follow_up_listen()
+
+    def _follow_up_listen(self) -> None:
+        """Re-open the mic without the wake word (conversation mode)."""
+        self._reset_turn(debounce_ms=0)
+        self._followup = True
+        self._listen_wait_ms = max(1000.0, float(self.ctx.floor_listen_ms))
+        self._set_state(State.AWAKE)
+        self._emit_event({"type": "event", "name": "beep", "kind": "followup"})
+        play_beep(
+            sample_rate=self.settings.sample_rate,
+            freq_hz=self.settings.beep_freq_hz * 1.25,
+            duration_ms=max(60, int(self.settings.beep_duration_ms * 0.6)),
+            volume=self.settings.beep_volume * 0.6,
+        )
+        self._wake_mute_until = time.monotonic() + (self.settings.beep_mute_ms / 1000.0)
+        self.capture.drain()
+        self.capture.start_utt_record()
+
+    def _on_followup_timeout(self) -> None:
+        """No reply in the follow-up window: let the floor holder decide."""
+        owner = self.router.floor_owner() if self.router is not None else None
+        logger.info("conversation follow-up timed out (owner=%s)", owner and owner.name)
+        if owner is not None:
+            try:
+                owner.on_floor_timeout(self.ctx)
+            except Exception:  # noqa: BLE001
+                logger.exception("on_floor_timeout failed")
+                self.ctx.floor = None
+        self._return_to_idle()
+
     def _maybe_play_alert(self) -> None:
         """Speak a queued plugin alert only between turns, never over an active one."""
-        if self._state != State.IDLE or self._alerts.empty():
+        if self._alerts.empty():
+            return
+        in_followup = (
+            self._followup
+            and self._state == State.LISTEN
+            and not self._heard_speech
+        )
+        if self._state != State.IDLE and not in_followup:
             return
         if self._asr_thread is not None and self._asr_thread.is_alive():
             return
+        if in_followup:
+            self.capture.stop_utt_record()
         try:
             alert: Announcement = self._alerts.get_nowait()
         except queue.Empty:
@@ -761,7 +835,7 @@ class WakeLoop:
                     )
                 self._reply(alert.intent, "", alert.text, kind="alert")
             finally:
-                self._return_to_idle()
+                self._after_turn()
 
         self._asr_thread = threading.Thread(target=_alert, name="pawn-alert", daemon=True)
         self._asr_thread.start()

@@ -139,6 +139,19 @@ commands:
     volume: 70        # mpv volume 0–100
     duck_volume: 12   # while PAWN listens / thinks / speaks
     duck_ramp_ms: 300
+  pawn:
+    # pawn-server (pawnai) base URL and its api.token (Bearer). Talks to
+    # POST /v1/pawn/voice; "parliamo" starts a conversation.
+    server_url: http://192.168.1.61:8000
+    token: ""
+    # Keypad code for "sblocca le sessioni" → full agent access (all skills
+    # and tools) until the conversation ends or unlock_max_minutes pass.
+    unlock_code: "1234"
+    unlock_max_minutes: 15
+    lockout_s: 60          # keypad disabled after 3 wrong codes
+    timeout_s: 90          # per agent turn
+    followup_timeout_s: 8  # silence after a reply that ends the conversation
+    thinking_cue_s: 4      # soft blip if pawn is still thinking
 
 beep:
   freq_hz: 880.0
