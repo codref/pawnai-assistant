@@ -60,7 +60,7 @@ Commands are **plugins** (`pawn_assistant/commands/builtin/`: core, clock, timer
 
 ### Web radio
 
-Stations come from TuneIn and play through `mpv` (never through the capture device). Configure under `commands.radio` — presets for stations TuneIn search ranks badly, a default for “accendi la radio”, volumes. The radio is **ducked** from wake until PAWN is idle again; with no echo cancellation the wake word still has to be heard over the radio at its normal volume.
+Stations come from TuneIn and play through `mpv` (never through the capture device). Configure under `commands.radio` — presets for stations TuneIn search ranks badly, a default for “accendi la radio”, volumes. The radio is **ducked** from wake until PAWN is idle again. Without echo cancellation the wake word still has to be heard over the radio at its normal volume; with `aec.enabled` mpv plays into the echo-cancel sink and the radio is subtracted from the mic.
 
 ## Choosing a voice
 
@@ -134,6 +134,18 @@ pawn-assistant serve --device 0   # sounddevice index from list-devices
 - Window layer over the stage: commands open live windows (timer countdown, radio station card). Drag by the title bar, resize from the corner, minimize to the tray, `Esc` closes; positions are remembered per window kind. `M` opens the MODULES manager.
 - Reloading the tab reconnects the WebSocket; the mic and models stay in the Python process.
 
+## Echo cancellation and barge-in
+
+With `aec.enabled: true` PAWN loads PipeWire's `module-echo-cancel` (WebRTC) at startup: the wake loop records from `pawn_ec_source`, and beeps, Piper replies and the radio play into `pawn_ec_sink`, so PAWN hears the room minus itself. That enables **barge-in**: say the wake word while PAWN is talking and it stops mid-sentence, beeps and listens for the new command (also works on timer alerts and inside a conversation).
+
+```bash
+pawn-assistant aec check          # what is missing (mic source, profile)
+pawn-assistant aec check --fix    # switch the card to its duplex profile
+pawn-assistant aec check --test   # load + unload the module once
+```
+
+PipeWire needs a real mic *source*. If the card sits on an output-only profile (the mic used as raw `hw:0,0`), switch it to **Analog Stereo Duplex** — the assistant then captures via `pulse` and `audio.device` is ignored. If AEC cannot start, PAWN logs why and keeps the old behaviour (mic ignored while it speaks, radio ducked). Barge-in uses a stricter threshold than a normal wake (`barge_in.threshold`, default `wake.threshold + 0.1`, two consecutive frames).
+
 ## Architecture
 
 ```
@@ -152,4 +164,3 @@ WebSocket: `ws://127.0.0.1:8787/ws` — see `draft/01-wake-ui.md`.
 
 - `pawnai-recorder` `/sessions/*`
 - pawn-server chat (open-ended questions land on `unknown`)
-- Barge-in / echo cancellation (mic is ignored while PAWN speaks)

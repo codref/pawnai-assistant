@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from pawn_assistant.audio import routing
+
 logger = logging.getLogger(__name__)
 
 MetaCallback = Callable[[str], None]
@@ -96,6 +98,7 @@ class MpvPlayer:
                 "--cache=yes",
                 f"--volume={int(volume)}",
                 f"--input-ipc-server={self._sock_path}",
+                *routing.mpv_audio_args(),  # echo-cancel sink when AEC is on
                 url,
             ]
             logger.info("radio: mpv %s", url)

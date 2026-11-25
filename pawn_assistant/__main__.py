@@ -903,6 +903,84 @@ def wake_test_cmd(
     live_test(path, device=device, seconds=seconds, threshold=threshold)
 
 
+
+# --------------------------------------------------------------- echo cancel
+
+aec_app = typer.Typer(
+    name="aec", help="Echo cancellation (PipeWire) for barge-in.", no_args_is_help=True
+)
+app.add_typer(aec_app, name="aec")
+
+
+@aec_app.command("check")
+def aec_check(
+    config: Optional[str] = _CONFIG_OPT,
+    fix: bool = typer.Option(
+        False, "--fix", help="Switch the sound card to a duplex profile if there is no mic source"
+    ),
+    test: bool = typer.Option(
+        False, "--test", help="Load module-echo-cancel briefly and unload it again"
+    ),
+) -> None:
+    """Can PAWN cancel its own voice? Shows what is missing and how to fix it."""
+    from pawn_assistant.audio import aec
+    from pawn_assistant.config import load_settings
+
+    settings = load_settings(config)
+    cfg = aec.AECSettings.from_mapping(settings.aec)
+    try:
+        state = aec.pulse_state()
+    except aec.AECUnavailable as exc:
+        console.print(f"[red]✗[/] {exc}")
+        raise typer.Exit(1) from exc
+    ok = "PipeWire" in state.server
+    console.print(f"{'[green]✓' if ok else '[yellow]![/]'}[/] server: {state.server}")
+    mics = aec.mic_sources(state, exclude=(cfg.source_name,))
+    if not mics:
+        console.print("[red]✗[/] no microphone source in PipeWire (card on an output-only profile)")
+        profiles = aec.duplex_profiles()
+        if not profiles:
+            console.print("  no duplex profile available on any card")
+            raise typer.Exit(1)
+        card, profile, desc = profiles[0]
+        console.print(f"  current: {aec.active_profile(card) or '?'}")
+        console.print(f"  duplex:  {profile} ({desc})")
+        if not fix:
+            console.print(f"  fix: [bold]pactl set-card-profile {card} {profile}[/] (or --fix)")
+            console.print(
+                "  then use audio.device: pulse — a raw hw:X,Y mic would hold the device"
+            )
+            raise typer.Exit(1)
+        aec.set_profile(card, profile)
+        console.print(f"[green]✓[/] switched {card} → {profile}")
+        state = aec.pulse_state()
+        mics = aec.mic_sources(state, exclude=(cfg.source_name,))
+        if not mics:
+            console.print("[red]✗[/] still no mic source (is another app holding hw:X,Y?)")
+            raise typer.Exit(1)
+    console.print(f"[green]✓[/] mic sources: {', '.join(mics)}")
+    console.print(f"  default sink: {state.default_sink}")
+    console.print(
+        f"  config: aec.enabled={cfg.enabled} method={cfg.method} "
+        f"barge_in={settings.barge_in_enabled} threshold={settings.barge_threshold:.2f}"
+    )
+    if not test:
+        if not cfg.enabled:
+            console.print("  enable with [bold]aec: {enabled: true}[/] in the YAML")
+        return
+    ec = aec.EchoCancel(cfg)
+    try:
+        ec.start()
+        console.print(
+            f"[green]✓[/] module-echo-cancel up: {cfg.source_name} ← {ec.source_master or '(existing)'}"
+        )
+    except aec.AECUnavailable as exc:
+        console.print(f"[red]✗[/] {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        ec.stop()
+
+
 def main() -> None:
     app()
 

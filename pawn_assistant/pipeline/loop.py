@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 import re
+import subprocess
 import threading
 import time
 from enum import Enum
@@ -14,7 +15,8 @@ from typing import Any, Callable, Optional
 import numpy as np
 import psutil
 
-from pawn_assistant.audio.beep import play_beep
+from pawn_assistant.audio.aec import AECSettings, AECUnavailable, EchoCancel
+from pawn_assistant.audio.beep import play_beep, play_pcm
 from pawn_assistant.audio.tts import PiperTTS
 from pawn_assistant.commands import CommandContext, CommandRegistry, CommandRouter
 from pawn_assistant.commands.base import Announcement
@@ -78,6 +80,8 @@ class WakeLoop:
         self.on_event = on_event or (lambda _e: None)
         self.on_meter = on_meter or (lambda _m: None)
 
+        self.aec_cfg = AECSettings.from_mapping(settings.aec)
+        self.aec: Optional[EchoCancel] = None
         self.capture = AudioCapture(
             sample_rate=settings.sample_rate,
             frame_samples=settings.frame_samples,
@@ -168,6 +172,11 @@ class WakeLoop:
         self._meter_interval = 1.0 / settings.meter_hz
         self._next_meter = 0.0
         self._lock = threading.Lock()
+        # Barge-in: set by the audio thread when the wake word cuts PAWN off;
+        # doubles as the stop flag for playback on the worker thread.
+        self._barge = threading.Event()
+        self._barge_hits = 0
+        self._speak_since: Optional[float] = None
 
     @property
     def state(self) -> State:
@@ -187,7 +196,28 @@ class WakeLoop:
                 "overruns": self.capture.overruns,
                 "rss_mb": self._rss_mb(),
                 "debug_audio": str(self.debug.directory) if self.debug else None,
+                "aec": self.aec_active,
+                "barge_in": self.barge_in_ready,
             }
+
+    @property
+    def aec_active(self) -> bool:
+        aec = getattr(self, "aec", None)
+        return bool(aec and aec.active)
+
+    @property
+    def barge_in_ready(self) -> bool:
+        s = self.settings
+        return bool(s.barge_in_enabled and (self.aec_active or not s.barge_in_require_aec))
+
+    def _clear_barge(self) -> None:
+        barge = getattr(self, "_barge", None)
+        if barge is not None:
+            barge.clear()
+
+    def _barged(self) -> bool:
+        barge = getattr(self, "_barge", None)
+        return bool(barge is not None and barge.is_set())
 
     @property
     def llm_resident(self) -> bool:
@@ -201,6 +231,7 @@ class WakeLoop:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._start_aec()
         try:
             self.wake.load()
             self.vad.load()
@@ -224,6 +255,28 @@ class WakeLoop:
             self.settings.debug_audio_dir,
         )
 
+    def _start_aec(self) -> None:
+        """Route mic + playback through PipeWire echo-cancel when configured."""
+        if not self.aec_cfg.enabled or self.aec_active:
+            return
+        aec = EchoCancel(self.aec_cfg)
+        try:
+            aec.start()
+        except (AECUnavailable, OSError, subprocess.SubprocessError) as exc:
+            logger.warning("echo cancellation unavailable: %s", exc)
+            self._emit_event({"type": "event", "name": "aec", "active": False, "message": str(exc)})
+            return
+        self.aec = aec
+        # PULSE_SOURCE now names the echo-cancel source: capture via "pulse".
+        self.capture = AudioCapture(
+            sample_rate=self.settings.sample_rate,
+            frame_samples=self.settings.frame_samples,
+            device="pulse",
+        )
+        self.gain = InputGain(self.capture, control=self.settings.gain_control)
+        logger.info("AEC active: capture=%s playback=%s", aec.cfg.source_name, aec.cfg.sink_name)
+        self._emit_event({"type": "event", "name": "aec", "active": True, "message": aec.cfg.source_name})
+
     def _apply_startup_gain(self) -> None:
         cfg = self.settings
         if self.gain.backend == "alsa":
@@ -242,6 +295,9 @@ class WakeLoop:
             self._asr_thread.join(timeout=5.0)
         self.capture.stop()
         self.commands.shutdown()
+        if self.aec is not None:
+            self.aec.stop()
+            self.aec = None
 
     # ------------------------------------------------------------------ commands API (server)
 
@@ -404,9 +460,14 @@ class WakeLoop:
         muted = time.monotonic() < self._wake_mute_until
 
         if self._state in _BUSY_STATES:
-            # Includes SPEAK: no AEC yet, so never score PAWN's own voice.
-            self._wake_score = 0.0
+            if self._state == State.SPEAK and self.barge_in_ready:
+                self._score_barge_in(frame)
+            else:
+                # No AEC: never score PAWN's own voice.
+                self._speak_since = None
+                self._wake_score = 0.0
             return
+        self._speak_since = None
 
         if self._state in (State.IDLE, State.STIR):
             if muted:
@@ -516,6 +577,42 @@ class WakeLoop:
             return
 
         self._wake_score = 0.0
+
+    def _score_barge_in(self, frame: np.ndarray) -> None:
+        """While PAWN speaks (echo-cancelled), listen for the wake word."""
+        now = time.monotonic()
+        if self._barge.is_set():
+            self._wake_score = 0.0
+            return
+        if self._speak_since is None:
+            # Fresh reply: wake features still hold pre-turn audio (often the
+            # wake word itself) — flush them before scoring.
+            self._speak_since = now
+            self._barge_hits = 0
+            self.wake.reset()
+        score = self.wake.score(frame)
+        armed = now - self._speak_since >= self.settings.barge_in_arm_ms / 1000.0
+        self._wake_score = score if armed else 0.0
+        if not armed:
+            return
+        if score >= self.settings.barge_threshold:
+            self._barge_hits += 1
+        else:
+            self._barge_hits = 0
+        if self._barge_hits >= max(1, int(self.settings.barge_in_frames)):
+            self._on_barge_in(score)
+
+    def _on_barge_in(self, score: float) -> None:
+        """Audio thread: cut PAWN off; the worker re-opens the mic when it unwinds."""
+        logger.info("barge-in score=%.3f — stopping reply", score)
+        self._barge.set()
+        self._barge_hits = 0
+        if self.debug is not None:
+            self.debug.save(
+                f"barge_{score:.2f}",
+                meta=f"wake_score={score:.3f} threshold={self.settings.barge_threshold}",
+            )
+        self._emit_event({"type": "event", "name": "barge_in", "score": round(score, 3)})
 
     def _maybe_dump_near_miss(self) -> None:
         if self.debug is None:
@@ -658,6 +755,7 @@ class WakeLoop:
             finally:
                 self._after_turn()
 
+        self._clear_barge()  # a late barge from the previous reply must not mute this one
         self._asr_thread = threading.Thread(
             target=_worker, name="pawn-asr", daemon=True
         )
@@ -692,6 +790,9 @@ class WakeLoop:
         spoken: list[str] = []
         try:
             for sentence in self.phraser.sentences(intent, user_text, canonical, stats):
+                if self._barged():
+                    stats.reason = "barge-in"
+                    break
                 spoken.append(sentence)
                 self._say(
                     sentence,
@@ -706,6 +807,8 @@ class WakeLoop:
         except Exception as exc:  # noqa: BLE001
             logger.exception("reply phrasing failed")
             stats.reason = f"error: {exc}"
+        if self._barged():
+            return
         if not spoken:
             logger.info("phrasing fell back to canonical (%s)", stats.reason)
             self._say(canonical, kind=kind, phrased=False)
@@ -726,7 +829,7 @@ class WakeLoop:
         **extra: Any,
     ) -> None:
         """Synthesize + play ``text``; the event carries ``full`` (reply so far)."""
-        if not text:
+        if not text or self._barged():
             return
         self._set_state(State.SPEAK)
         payload = {
@@ -745,9 +848,14 @@ class WakeLoop:
             speech = self.tts.synthesize(text)
             payload["tts_ms"] = round(speech.synth_ms, 1)
             self._emit_event(payload)
-            from pawn_assistant.audio.beep import play_pcm
-
-            play_pcm(speech.pcm, speech.sample_rate, block=True)
+            if self._barged():
+                return
+            play_pcm(
+                speech.pcm,
+                speech.sample_rate,
+                block=True,
+                stop=getattr(self, "_barge", None),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("TTS failed")
             self._emit_event(payload)
@@ -758,6 +866,8 @@ class WakeLoop:
         parts = [p for p in _SENTENCE_SPLIT.split((text or "").strip()) if p.strip()]
         spoken: list[str] = []
         for part in parts:
+            if self._barged():
+                break
             spoken.append(part.strip())
             self._say(part.strip(), kind=kind, full=" ".join(spoken), seq=len(spoken) - 1)
 
@@ -768,6 +878,10 @@ class WakeLoop:
 
     def _after_turn(self) -> None:
         """End of a spoken turn: keep the mic open while a command holds the floor."""
+        if self._barged() and not self._stop.is_set():
+            self._barge.clear()
+            self._barge_listen()
+            return
         if not self._floor_active() or self._stop.is_set():
             self._return_to_idle()
             return
@@ -789,6 +903,27 @@ class WakeLoop:
         self._wake_mute_until = time.monotonic() + (self.settings.beep_mute_ms / 1000.0)
         self.capture.drain()
         self.capture.start_utt_record()
+
+    def _barge_listen(self) -> None:
+        """After a barge-in: same as a fresh wake (beep, LISTEN), minus the score."""
+        self._reset_turn(debounce_ms=0)
+        if self._floor_active():
+            # Mid-conversation: silence after the interruption hands the floor
+            # holder its usual timeout instead of dropping to IDLE.
+            self._followup = True
+            self._listen_wait_ms = max(1000.0, float(self.ctx.floor_listen_ms))
+        self._set_state(State.AWAKE)
+        self._emit_event({"type": "event", "name": "beep", "kind": "barge"})
+        play_beep(
+            sample_rate=self.settings.sample_rate,
+            freq_hz=self.settings.beep_freq_hz,
+            duration_ms=self.settings.beep_duration_ms,
+            volume=self.settings.beep_volume,
+        )
+        self._wake_mute_until = time.monotonic() + (self.settings.beep_mute_ms / 1000.0)
+        self.capture.drain()
+        self.capture.start_utt_record()
+        self._prefetch_models()
 
     def _on_followup_timeout(self) -> None:
         """No reply in the follow-up window: let the floor holder decide."""
@@ -826,6 +961,8 @@ class WakeLoop:
         def _alert() -> None:
             try:
                 for _ in range(max(0, alert.beeps)):
+                    if self._barged():
+                        break
                     play_beep(
                         sample_rate=self.settings.sample_rate,
                         freq_hz=self.settings.beep_freq_hz * 1.5,
@@ -837,5 +974,6 @@ class WakeLoop:
             finally:
                 self._after_turn()
 
+        self._clear_barge()
         self._asr_thread = threading.Thread(target=_alert, name="pawn-alert", daemon=True)
         self._asr_thread.start()

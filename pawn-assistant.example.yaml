@@ -153,6 +153,29 @@ commands:
     followup_timeout_s: 8  # silence after a reply that ends the conversation
     thinking_cue_s: 4      # soft blip if pawn is still thinking
 
+aec:
+  # Echo cancellation via PipeWire module-echo-cancel (WebRTC). PAWN records
+  # from the echo-cancelled source and plays beeps/voice/radio into the paired
+  # sink, so it can hear the wake word over itself (barge-in). Needs a mic
+  # *source* in PipeWire: check with `pawn-assistant aec check`. When active,
+  # audio.device is ignored (capture goes through "pulse").
+  enabled: false
+  method: webrtc          # webrtc | null (passthrough, for A/B)
+  # source_master: alsa_input.pci-0000_00_1f.3.analog-stereo   # default: default mic
+  # sink_master: alsa_output.pci-0000_00_1f.3.analog-stereo    # default: default sink
+  # aec_args: "webrtc.noise_suppression=true webrtc.gain_control=false"
+  keep_loaded: false
+
+barge_in:
+  # Say the wake word while PAWN talks to cut it off and give a new command.
+  enabled: true
+  # Wake score needed while PAWN speaks; null = wake.threshold + 0.1.
+  threshold: null
+  frames: 2           # consecutive 80 ms frames over the threshold
+  arm_ms: 300         # ignore the first part of each reply
+  # Off without AEC: PAWN's own voice would reach the wake model.
+  require_aec: true
+
 beep:
   freq_hz: 880.0
   duration_ms: 120

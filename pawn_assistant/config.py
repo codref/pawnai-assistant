@@ -110,6 +110,20 @@ class Settings:
     # "all" or a list of intent names (timer.alert = spoken timer alerts).
     phrase_intents: Any = "all"
 
+    # Point 5 — echo cancellation: raw ``aec:`` YAML section (see audio/aec.py).
+    aec: dict = field(default_factory=dict)
+    # Barge-in: the wake word interrupts PAWN while it speaks.
+    barge_in_enabled: bool = True
+    # Wake score needed while PAWN talks. None = wake.threshold + 0.1.
+    barge_in_threshold: Optional[float] = None
+    # Consecutive 80 ms frames at/above the threshold.
+    barge_in_frames: int = 2
+    # Ignore the first N ms of each reply (playback onset, stale wake features).
+    barge_in_arm_ms: int = 300
+    # Without echo cancellation PAWN's own voice reaches the wake model, so
+    # barge-in stays off unless this is false.
+    barge_in_require_aec: bool = True
+
     # Command plugins: raw ``commands:`` YAML section — ``disabled: [...]``,
     # ``state_file``, plus one sub-mapping per plugin (e.g. ``radio: {...}``).
     commands: dict = field(default_factory=dict)
@@ -128,6 +142,12 @@ class Settings:
 
             return default_state_dir() / "commands.json"
         return Path(str(raw)).expanduser()
+
+    @property
+    def barge_threshold(self) -> float:
+        if self.barge_in_threshold is not None:
+            return float(self.barge_in_threshold)
+        return min(0.95, float(self.wake_threshold) + 0.1)
 
     @property
     def frame_ms(self) -> float:
@@ -222,6 +242,11 @@ def _flatten_yaml(data: Mapping[str, Any]) -> dict[str, Any]:
         ("phrase", "max_sentences"): "phrase_max_sentences",
         ("phrase", "first_sentence_timeout_s"): "phrase_first_sentence_timeout_s",
         ("phrase", "intents"): "phrase_intents",
+        ("barge_in", "enabled"): "barge_in_enabled",
+        ("barge_in", "threshold"): "barge_in_threshold",
+        ("barge_in", "frames"): "barge_in_frames",
+        ("barge_in", "arm_ms"): "barge_in_arm_ms",
+        ("barge_in", "require_aec"): "barge_in_require_aec",
     }
     for keys, field_name in mapping.items():
         if _dig(data, *keys, default=_MISSING) is not _MISSING:
@@ -229,6 +254,8 @@ def _flatten_yaml(data: Mapping[str, Any]) -> dict[str, Any]:
 
     if isinstance(data.get("commands"), Mapping):
         out["commands"] = dict(data["commands"])
+    if isinstance(data.get("aec"), Mapping):
+        out["aec"] = dict(data["aec"])
 
     # Flat keys also accepted for convenience.
     valid = {f.name for f in fields(Settings)} - {"extra", "config_path"}

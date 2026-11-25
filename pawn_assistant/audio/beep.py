@@ -7,10 +7,14 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
+
+from pawn_assistant.audio import routing
 
 logger = logging.getLogger(__name__)
 
@@ -32,26 +36,40 @@ def _wav_bytes(
     return pcm.tobytes()
 
 
-def _play_wav_file(path: Path, timeout: float) -> bool:
-    players = [
-        ["paplay", str(path)],
-        ["pw-play", str(path)],
-        ["aplay", "-q", str(path)],
-    ]
-    for cmd in players:
-        if not shutil.which(cmd[0]):
+def _play_wav_file(
+    path: Path, timeout: float, stop: Optional[threading.Event] = None
+) -> bool:
+    """Play through PipeWire/Pulse; returns early (killing the player) if *stop* is set."""
+    for player in ("paplay", "pw-play", "aplay"):
+        if not shutil.which(player):
             continue
+        cmd = routing.player_command(str(path), player)
         try:
-            subprocess.run(
-                cmd,
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=timeout,
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            return True
         except Exception as exc:  # noqa: BLE001
-            logger.debug("playback via %s failed: %s", cmd[0], exc)
+            logger.debug("playback via %s failed: %s", player, exc)
+            continue
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=0.03)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if (stop is not None and stop.is_set()) or time.monotonic() > deadline:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    break
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        return True
     logger.warning("no paplay/pw-play/aplay — skipping audio playback")
     return False
 
@@ -62,11 +80,13 @@ def play_pcm(
     *,
     block: bool = True,
     timeout: float = 60.0,
+    stop: Optional[threading.Event] = None,
 ) -> None:
     """Play mono int16 PCM through an external player (never sounddevice).
 
     Uses ``paplay`` / ``pw-play`` / ``aplay`` so exclusive ALSA ``hw:X,Y``
     input is not interrupted by a concurrent PortAudio output stream.
+    Setting *stop* cuts playback short (barge-in).
     """
 
     def _run() -> None:
@@ -79,7 +99,9 @@ def play_pcm(
                 wf.setsampwidth(2)
                 wf.setframerate(sample_rate)
                 wf.writeframes(pcm)
-            _play_wav_file(path, timeout)
+            if stop is not None and stop.is_set():
+                return
+            _play_wav_file(path, timeout, stop)
         except Exception:  # noqa: BLE001
             logger.exception("playback failed")
         finally:

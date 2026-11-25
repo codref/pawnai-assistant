@@ -230,6 +230,13 @@
           appendToLatest("reply", `PAWN: ${ev.text}`);
         }
       }
+    } else if (ev.name === "barge_in") {
+      appendToLatest("barge", `✂ cut off (wake ${ev.score})`);
+    } else if (ev.name === "aec") {
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = ev.active ? `AEC on · ${ev.message}` : `AEC off · ${ev.message}`;
+      els.log.prepend(li);
     } else if (ev.name === "fault") {
       setState("FAULT");
       const li = document.createElement("li");
