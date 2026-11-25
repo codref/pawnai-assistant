@@ -39,6 +39,87 @@ def place_in_window(
     return np.clip(out, -1.0, 1.0).astype(np.float32)
 
 
+# ---------------------------------------------------------------- augmentation
+
+# Negative categories that make useful backgrounds under a positive (people
+# talking, the room, the radio) — not silence, not other wake-like clips.
+_BACKGROUND_SKIP = ("silence",)
+# Mistakes the live model already made: worth more than one look each.
+_HARD_NEGATIVE_PREFIX = "live_"
+
+
+def speed_perturb(clip: np.ndarray, factor: float) -> np.ndarray:
+    """Resample so the phrase plays ``factor``× faster (pitch shifts with it)."""
+    if abs(factor - 1.0) < 1e-3 or clip.size < 2:
+        return clip.astype(np.float32)
+    n_out = max(2, int(round(clip.size / factor)))
+    x_old = np.linspace(0.0, 1.0, num=clip.size, endpoint=False)
+    x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+    return np.interp(x_new, x_old, clip.astype(np.float64)).astype(np.float32)
+
+
+def synthetic_rir(rng: np.random.Generator, sample_rate: int = 16_000) -> np.ndarray:
+    """Cheap room impulse response: direct path + exponentially decaying noise."""
+    rt60 = float(rng.uniform(0.15, 0.6))
+    n = int(rt60 * sample_rate)
+    t = np.arange(n, dtype=np.float32) / sample_rate
+    tail = rng.normal(0.0, 1.0, n).astype(np.float32) * np.exp(-6.9 * t / rt60).astype(np.float32)
+    predelay = int(rng.uniform(0.002, 0.012) * sample_rate)
+    tail[:predelay] = 0.0
+    tail *= float(rng.uniform(0.15, 0.5)) / max(1e-6, float(np.sqrt(np.sum(tail**2))))
+    tail[0] = 1.0
+    return tail
+
+
+def add_reverb(clip: np.ndarray, rng: np.random.Generator, sample_rate: int = 16_000) -> np.ndarray:
+    from scipy.signal import fftconvolve
+
+    wet = fftconvolve(clip.astype(np.float32), synthetic_rir(rng, sample_rate))[: clip.size]
+    peak_in = float(np.max(np.abs(clip))) or 1.0
+    peak_out = float(np.max(np.abs(wet))) or 1.0
+    return (wet * (peak_in / peak_out)).astype(np.float32)
+
+
+def mix_at_snr(
+    clip: np.ndarray, noise: np.ndarray, snr_db: float, rng: np.random.Generator
+) -> np.ndarray:
+    """Lay *noise* (looped/cropped to fit) under *clip* at ``snr_db``."""
+    if noise.size == 0:
+        return clip
+    if noise.size < clip.size:
+        noise = np.tile(noise, int(np.ceil(clip.size / noise.size)))
+    start = int(rng.integers(0, noise.size - clip.size + 1))
+    bed = noise[start : start + clip.size].astype(np.float32)
+    p_clip = float(np.mean(clip**2)) or 1e-9
+    p_bed = float(np.mean(bed**2)) or 1e-9
+    scale = np.sqrt(p_clip / (p_bed * 10 ** (snr_db / 10.0)))
+    return np.clip(clip + bed * scale, -1.0, 1.0).astype(np.float32)
+
+
+def augment_positive(
+    clip: np.ndarray,
+    window_samples: int,
+    rng: np.random.Generator,
+    backgrounds: list[np.ndarray],
+    sample_rate: int = 16_000,
+) -> np.ndarray:
+    """One training window: speed, room, background and level variation."""
+    out = clip.astype(np.float32)
+    if rng.random() < 0.7:
+        out = speed_perturb(out, float(rng.uniform(0.9, 1.1)))
+    if rng.random() < 0.5:
+        out = add_reverb(out, rng, sample_rate)
+    windowed = place_in_window(out, window_samples, rng)
+    if backgrounds and rng.random() < 0.5:
+        bed = backgrounds[int(rng.integers(0, len(backgrounds)))]
+        windowed = mix_at_snr(windowed, bed, float(rng.uniform(5.0, 20.0)), rng)
+    else:
+        windowed = windowed + _noise_floor(window_samples, rng, level=float(rng.uniform(1e-4, 8e-4)))
+    # Far-field / quiet speaker as well as close and loud.
+    windowed = windowed * float(rng.uniform(0.35, 1.0))
+    return np.clip(windowed, -1.0, 1.0).astype(np.float32)
+
+
 def negative_windows(
     clip: np.ndarray,
     window_samples: int,
@@ -86,11 +167,30 @@ def embed_window(audio: np.ndarray, sample_rate: int = 16_000) -> np.ndarray:
     return feat.astype(np.float32)
 
 
+def _load_backgrounds(
+    neg_paths: list[Path], negatives_dir: Path, sample_rate: int, rng: np.random.Generator,
+    limit: int = 200,
+) -> list[np.ndarray]:
+    cands = [
+        p for p in neg_paths
+        if not any(part in _BACKGROUND_SKIP for part in p.relative_to(negatives_dir).parts[:-1])
+    ]
+    if len(cands) > limit:
+        cands = [cands[i] for i in sorted(rng.choice(len(cands), size=limit, replace=False))]
+    out = []
+    for path in cands:
+        clip = load_clip_16k(path, sample_rate)
+        if clip.size and float(np.max(np.abs(clip))) > 1e-3:
+            out.append(clip)
+    return out
+
+
 def build_feature_arrays(
     project: WakeProject,
     *,
     augment_positives: int = 4,
     seed: int = 0,
+    hard_negative_copies: int = 3,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns train_x, train_y, val_x, val_y.
@@ -114,23 +214,22 @@ def build_feature_arrays(
         )
 
     logger.info(
-        "embedding %d positives (×%d aug) and %d negatives…",
+        "embedding %d positives (×%d: speed/reverb/background) and %d negatives…",
         len(pos_paths),
         augment_positives,
         len(neg_paths),
     )
 
+    backgrounds = _load_backgrounds(neg_paths, project.negatives_dir, project.sample_rate, rng)
+    logger.info("%d background clips for positive mixing", len(backgrounds))
+
     pos_feats: list[np.ndarray] = []
     for path in pos_paths:
         clip = load_clip_16k(path, project.sample_rate)
-        for _ in range(augment_positives):
-            windowed = place_in_window(clip, window, rng)
-            # Mild noise mix
-            windowed = np.clip(
-                windowed + _noise_floor(window, rng, level=float(rng.uniform(1e-4, 8e-4))),
-                -1.0,
-                1.0,
-            )
+        # First copy stays close to the recording; the rest are augmented.
+        pos_feats.append(embed_window(place_in_window(clip, window, rng), project.sample_rate))
+        for _ in range(max(0, augment_positives - 1)):
+            windowed = augment_positive(clip, window, rng, backgrounds, project.sample_rate)
             pos_feats.append(embed_window(windowed, project.sample_rate))
 
     neg_feats: list[np.ndarray] = []
@@ -138,6 +237,11 @@ def build_feature_arrays(
         clip = load_clip_16k(path, project.sample_rate)
         for windowed in negative_windows(clip, window, rng):
             neg_feats.append(embed_window(windowed, project.sample_rate))
+        if path.parent.name.startswith(_HARD_NEGATIVE_PREFIX):
+            # Real false wakes: jittered extra copies so they weigh more.
+            for _ in range(max(0, hard_negative_copies - 1)):
+                jitter = place_in_window(clip, window, rng) * float(rng.uniform(0.6, 1.2))
+                neg_feats.append(embed_window(np.clip(jitter, -1, 1), project.sample_rate))
         if i % 100 == 0:
             logger.info("negatives %d/%d (%d windows)", i, len(neg_paths), len(neg_feats))
 

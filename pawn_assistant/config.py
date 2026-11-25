@@ -49,6 +49,10 @@ class Settings:
     beep_mute_ms: int = 600
     # Refractory after a full turn so openWakeWord can refill features.
     wake_debounce_ms: int = 1_200
+    # Save live wake clips (auto-labelled) into the wake-train project inbox:
+    # auto = when wake_model lives in a project | true | false | project path.
+    wake_harvest: Any = "auto"
+    wake_harvest_max: int = 500
     whisper_model: str = "small"
     whisper_compute_type: str = "int8"
     whisper_idle_unload_s: float = 60.0
@@ -200,6 +204,8 @@ def _flatten_yaml(data: Mapping[str, Any]) -> dict[str, Any]:
         ("wake", "stir_threshold"): "stir_threshold",
         ("wake", "beep_mute_ms"): "beep_mute_ms",
         ("wake", "debounce_ms"): "wake_debounce_ms",
+        ("wake", "harvest"): "wake_harvest",
+        ("wake", "harvest_max"): "wake_harvest_max",
         ("vad", "threshold"): "vad_threshold",
         ("vad", "energy_speech_db"): "energy_speech_db",
         ("vad", "silence_end_ms"): "silence_end_ms",

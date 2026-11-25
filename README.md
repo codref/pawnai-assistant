@@ -109,6 +109,21 @@ pawn-assistant serve --device 0 --wake-model wakewords/hey_pawn/hey_pawn.onnx
 
 Keep the mic out of clipping (peaks well below 0 dBFS in `monitor`) — clipped audio distorts the wake features.
 
+### Improving it from real use
+
+While `serve` runs a project's model, every wake saves the 2 s that triggered it into `wakewords/hey_pawn/inbox/`, labelled by what happened next: `confirmed` (a command followed), `false_wake` (silence or empty transcript), `unsure` (speech, no command understood), `near_miss` (scored in the stir band) and `barge` (heard over PAWN's own voice). Nothing is trained on until you file it:
+
+```bash
+pawn-assistant wake-train inbox    -p wakewords/hey_pawn   # counts per label
+pawn-assistant wake-train review   -p wakewords/hey_pawn -l near_miss -l unsure   # listen: w / n / d
+pawn-assistant wake-train accept   -p wakewords/hey_pawn   # confirmed+barge → positives, false_wake → negatives
+pawn-assistant wake-train train    -p wakewords/hey_pawn --out wakewords/hey_pawn/hey_pawn.v2.onnx
+pawn-assistant wake-train calibrate -p wakewords/hey_pawn --model wakewords/hey_pawn/hey_pawn.v2.onnx
+pawn-assistant wake-train calibrate -p wakewords/hey_pawn --write pawn-assistant.yaml   # set thresholds
+```
+
+Training augments every positive (speed ±10 %, synthetic room reverb, real negatives mixed underneath at 5–20 dB SNR, far-field levels), and live false wakes (`negatives/live_*`) count three times. `calibrate` streams each clip through openWakeWord the way `serve` does, prints recall / false positives per threshold, the hardest negatives and weakest positives, and suggests `wake.threshold` and `barge_in.threshold`. Run calibrate on inbox clips before accepting them: they are the only clips the model has not been trained on.
+
 Record positives hands-free (countdown cadence — don’t type between takes). Record negatives **one category at a time**. Silence/ambient negatives matter so the model does not learn “quiet room = wake”.
 
 

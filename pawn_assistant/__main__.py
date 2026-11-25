@@ -861,6 +861,9 @@ def wake_train_cmd(
     project: str = typer.Option(..., "--project", "-p"),
     steps: int = typer.Option(4000, help="Training steps"),
     augment: int = typer.Option(4, help="Augmentations per positive clip"),
+    out: Optional[str] = typer.Option(
+        None, "--out", help="Write the ONNX here instead of <project>/<model_name>.onnx (A/B)"
+    ),
 ) -> None:
     """Embed clips, train classifier, write <model_name>.onnx."""
     logging.basicConfig(
@@ -872,13 +875,164 @@ def wake_train_cmd(
 
     proj = WakeProject.load(Path(project))
     path = train_and_export(
-        proj, steps=steps, augment_positives=augment
+        proj, steps=steps, augment_positives=augment, out=Path(out) if out else None
     )
     console.print(f"[bold green]Model ready[/] {path}")
     console.print(
         f"Test:  pawn-assistant wake-train test --project {proj.root} --device 0\n"
         f"Serve: pawn-assistant serve --device 0 --wake-model {path}"
     )
+
+
+@wake_train_app.command("inbox")
+def wake_inbox_cmd(
+    project: str = typer.Option(..., "--project", "-p"),
+) -> None:
+    """Clips harvested by `serve` (auto-labelled), waiting for review/accept."""
+    from pawn_assistant.wake_train.harvest import ACCEPT_TO, inbox_clips
+
+    proj_root = Path(project)
+    clips = inbox_clips(proj_root)
+    if not clips:
+        console.print("inbox empty — run `serve` with this project's model (wake.harvest: auto)")
+        return
+    table = Table("label", "clips", "score range", "accept →")
+    by: dict[str, list[float]] = {}
+    for c in clips:
+        by.setdefault(c.label, []).append(c.score)
+    for label, scores in sorted(by.items()):
+        table.add_row(
+            label, str(len(scores)), f"{min(scores):.2f}–{max(scores):.2f}",
+            {"pos": "positives", "neg": f"negatives/live_{label}"}.get(ACCEPT_TO.get(label) or "", "review"),
+        )
+    console.print(table)
+
+
+@wake_train_app.command("review")
+def wake_review_cmd(
+    project: str = typer.Option(..., "--project", "-p"),
+    label: Optional[list[str]] = typer.Option(None, "--label", "-l", help="Only these labels"),
+) -> None:
+    """Listen to inbox clips: w=wake (positive) · n=not wake · d=delete · r=replay · s=skip · q=quit."""
+    from pawn_assistant.audio.beep import play_pcm
+    from pawn_assistant.wake_train.harvest import file_clip, inbox_clips
+    from pawn_assistant.wake_train.io_wav import load_clip_16k
+
+    root = Path(project)
+    clips = inbox_clips(root, label or None)
+    if not clips:
+        console.print("nothing to review")
+        return
+    moved = {"pos": 0, "neg": 0, "drop": 0}
+    for i, clip in enumerate(clips, 1):
+        audio = load_clip_16k(clip.path)
+        pcm = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16).tobytes()
+        extra = " ".join(f"{k}={v}" for k, v in clip.meta.items() if k in ("text", "intent", "reason"))
+        console.print(
+            f"\n[bold cyan]{clip.label}[/] {i}/{len(clips)} score {clip.score:.2f}  {extra}"
+        )
+        while True:
+            play_pcm(pcm, 16_000, block=True)
+            console.print("[dim]w wake · n not wake · d delete · r replay · s skip · q quit[/]")
+            key = _getkey()
+            if key == "r":
+                continue
+            break
+        if key == "q":
+            break
+        kind = {"w": "pos", "y": "pos", "n": "neg", "d": "drop"}.get(key)
+        if kind:
+            file_clip(root, clip, kind)
+            moved[kind] += 1
+    console.print(
+        f"positives +{moved['pos']} · negatives +{moved['neg']} · deleted {moved['drop']}"
+        + ("  → retrain: pawn-assistant wake-train train -p " + project if moved["pos"] or moved["neg"] else "")
+    )
+
+
+@wake_train_app.command("accept")
+def wake_accept_cmd(
+    project: str = typer.Option(..., "--project", "-p"),
+    label: Optional[list[str]] = typer.Option(
+        None, "--label", "-l", help="Labels to accept (default: confirmed, barge, false_wake)"
+    ),
+    min_score: float = typer.Option(
+        0.0, help="Only accept clips whose live wake score was at least this"
+    ),
+) -> None:
+    """File auto-labelled inbox clips without listening (trust the outcome label)."""
+    from pawn_assistant.wake_train.harvest import ACCEPT_TO, file_clip, inbox_clips
+
+    root = Path(project)
+    wanted = label or [k for k, v in ACCEPT_TO.items() if v]
+    moved = {"pos": 0, "neg": 0}
+    review_only = sorted({lb for lb in wanted if ACCEPT_TO.get(lb) is None})
+    for lb in review_only:
+        console.print(f"[yellow]{lb} needs a listen[/] (wake-train review -l {lb})")
+    for clip in inbox_clips(root, wanted):
+        kind = ACCEPT_TO.get(clip.label)
+        if kind is None:
+            continue
+        if clip.score < min_score:
+            continue
+        file_clip(root, clip, kind)
+        moved[kind] += 1
+    console.print(f"positives +{moved['pos']} · negatives +{moved['neg']}")
+
+
+@wake_train_app.command("calibrate")
+def wake_calibrate_cmd(
+    project: str = typer.Option(..., "--project", "-p"),
+    model: Optional[str] = typer.Option(None, help="ONNX to score (default: project model)"),
+    max_fpr: float = typer.Option(0.0, help="Allowed share of negatives over threshold"),
+    margin: float = typer.Option(0.05, help="Headroom above the negatives' tail"),
+    write: Optional[str] = typer.Option(
+        None, "--write", help="YAML config to update (wake.threshold, barge_in.threshold)"
+    ),
+) -> None:
+    """Score every clip like `serve` does and suggest wake / barge-in thresholds."""
+    from pawn_assistant.wake_train.calibrate import calibrate, rates
+    from pawn_assistant.wake_train.project import WakeProject
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    proj = WakeProject.load(Path(project))
+    path = Path(model) if model else proj.model_path
+    if not path.exists():
+        console.print(f"[red]Missing model[/] {path}")
+        raise typer.Exit(1)
+    cal = calibrate(proj, model_path=path, max_fpr=max_fpr, margin=margin)
+
+    table = Table("threshold", "recall (train)", "FP (train)", "recall (inbox)", "FP (inbox)")
+    for thr in (0.3, 0.4, 0.5, 0.6, 0.7, 0.8, cal.threshold):
+        tr, tf = rates(cal.train.pos, cal.train.neg, thr)
+        ir, inf = rates(cal.inbox.pos, cal.inbox.neg, thr)
+        style = "bold green" if thr == cal.threshold else ""
+        table.add_row(
+            f"[{style}]{thr:.2f}[/]" if style else f"{thr:.2f}",
+            f"{100 * tr:.0f}%", f"{tf}/{len(cal.train.neg)}",
+            f"{100 * ir:.0f}%" if cal.inbox.pos else "–",
+            f"{inf}/{len(cal.inbox.neg)}" if cal.inbox.neg else "–",
+        )
+    console.print(table)
+    for title, rows in (("hardest negatives", cal.train.worst_neg + cal.inbox.worst_neg),
+                        ("weakest positives", cal.train.worst_pos + cal.inbox.worst_pos)):
+        rows = sorted(rows, reverse=title.startswith("hardest"))[:5]
+        if rows:
+            console.print(f"[dim]{title}:[/] " + ", ".join(f"{Path(p).name} {s:.2f}" for s, p in rows))
+    console.print(
+        f"suggested wake.threshold [bold]{cal.threshold:.2f}[/] (recall {100 * cal.recall:.0f}%, "
+        f"{cal.false_positives}/{cal.negatives} negatives over) · barge_in.threshold "
+        f"[bold]{cal.barge_threshold:.2f}[/]"
+    )
+    if not cal.inbox.pos and not cal.inbox.neg:
+        console.print("[dim]train clips only — optimistic; harvest live clips for an honest check[/]")
+    if write:
+        from pawn_assistant.audio.voices import update_yaml_section
+
+        cfg = Path(write)
+        update_yaml_section(cfg, "wake", {"threshold": cal.threshold})
+        update_yaml_section(cfg, "barge_in", {"threshold": cal.barge_threshold})
+        console.print(f"[green]wrote[/] {cfg}")
 
 
 @wake_train_app.command("test")

@@ -34,6 +34,7 @@ from pawn_assistant.config import Settings
 from pawn_assistant.pipeline.asr import WhisperASR
 from pawn_assistant.pipeline.vad import SileroVAD
 from pawn_assistant.pipeline.wake import WakeDetector
+from pawn_assistant.wake_train.harvest import WakeHarvester, resolve_harvest_root
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,15 @@ class WakeLoop:
                 preroll_s=settings.debug_preroll_s,
             )
 
+        self.harvest: Optional[WakeHarvester] = None
+        harvest_root = resolve_harvest_root(settings.wake_harvest, settings.wake_model)
+        if harvest_root is not None:
+            self.harvest = WakeHarvester(
+                harvest_root,
+                sample_rate=settings.sample_rate,
+                max_per_label=settings.wake_harvest_max,
+            )
+
         self._state = State.IDLE
         self._state_since = time.monotonic()
         self._thread: Optional[threading.Thread] = None
@@ -209,6 +219,14 @@ class WakeLoop:
     def barge_in_ready(self) -> bool:
         s = self.settings
         return bool(s.barge_in_enabled and (self.aec_active or not s.barge_in_require_aec))
+
+    def _harvest(self) -> Optional[WakeHarvester]:
+        return getattr(self, "harvest", None)
+
+    def _harvest_resolve(self, label: str, **meta: Any) -> None:
+        harvest = self._harvest()
+        if harvest is not None:
+            harvest.resolve(label, **meta)
 
     def _clear_barge(self) -> None:
         barge = getattr(self, "_barge", None)
@@ -443,6 +461,8 @@ class WakeLoop:
             self._last_frame_at = time.monotonic()
             if self.debug is not None:
                 self.debug.push(frame)
+            if self.harvest is not None:
+                self.harvest.push(frame)
             try:
                 self._handle_frame(frame, frame_ms)
             except Exception as exc:  # noqa: BLE001
@@ -475,6 +495,13 @@ class WakeLoop:
             else:
                 self._wake_score = self.wake.score(frame)
                 self._maybe_dump_near_miss()
+                harvest = self._harvest()
+                if harvest is not None:
+                    harvest.on_score(
+                        self._wake_score,
+                        self.settings.stir_threshold,
+                        self.settings.wake_threshold,
+                    )
             if self._wake_score >= self.settings.wake_threshold:
                 self._on_wake()
             elif self._wake_score >= self.settings.stir_threshold:
@@ -538,6 +565,7 @@ class WakeLoop:
                     self._on_followup_timeout()
                     return
                 logger.info("no speech after wake — back to idle")
+                self._harvest_resolve("false_wake", reason="no_speech")
                 if self.debug is not None:
                     audio = self._utt_audio_16k()
                     self.debug.save(
@@ -613,6 +641,9 @@ class WakeLoop:
                 meta=f"wake_score={score:.3f} threshold={self.settings.barge_threshold}",
             )
         self._emit_event({"type": "event", "name": "barge_in", "score": round(score, 3)})
+        harvest = self._harvest()
+        if harvest is not None:
+            harvest.on_barge(score)
 
     def _maybe_dump_near_miss(self) -> None:
         if self.debug is None:
@@ -634,6 +665,9 @@ class WakeLoop:
 
     def _on_wake(self) -> None:
         logger.info("wake detected score=%.3f", self._wake_score)
+        harvest = self._harvest()
+        if harvest is not None:
+            harvest.on_wake(self._wake_score)
         if self.debug is not None:
             self.debug.save(
                 f"wake_{self._wake_score:.2f}",
@@ -731,6 +765,7 @@ class WakeLoop:
                             "reason": "too_short",
                         }
                     )
+                    self._harvest_resolve("false_wake", reason="too_short")
                 else:
                     result = self.asr.transcribe(
                         audio, sample_rate=self.settings.sample_rate
@@ -746,7 +781,11 @@ class WakeLoop:
                         }
                     )
                     if result.text:
-                        self._run_command(result.text)
+                        intent = self._run_command(result.text)
+                        label = "unsure" if intent == "unknown" else "confirmed"
+                        self._harvest_resolve(label, text=result.text, intent=intent)
+                    else:
+                        self._harvest_resolve("false_wake", reason="empty_transcript")
             except Exception as exc:  # noqa: BLE001
                 logger.exception("ASR failed")
                 self._emit_event(
@@ -763,17 +802,18 @@ class WakeLoop:
 
     # ------------------------------------------------------------------ point 2
 
-    def _run_command(self, text: str) -> None:
+    def _run_command(self, text: str) -> Optional[str]:
         """THINK → intent → SPEAK reply. Runs on the ASR worker thread."""
         if self.router is None:
-            return
+            return None
         self._set_state(State.THINK)
         result = self.router.handle(text)
         self._emit_event(result.as_event())
         if result.source == "floor":
             self._say_sentences(result.reply)
-        else:
-            self._reply(result.intent, text, result.reply)
+            return "floor"
+        self._reply(result.intent, text, result.reply)
+        return result.intent
 
     def _reply(self, intent: str, user_text: str, canonical: str, *, kind: str = "reply") -> None:
         """Speak ``canonical``, reworded by the LLM when phrasing applies.

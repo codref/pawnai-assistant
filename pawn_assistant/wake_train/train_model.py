@@ -58,6 +58,7 @@ def train_and_export(
     lr: float = 1e-3,
     augment_positives: int = 4,
     seed: int = 0,
+    out: Optional[Path] = None,
 ) -> Path:
     torch, nn = _require_torch()
     # Ensure OWW feature ONNX models exist.
@@ -145,7 +146,7 @@ def train_and_export(
         model.load_state_dict(best_state)
     model.eval()
 
-    out = project.model_path
+    out = out or project.model_path
     dummy = torch.rand(1, N_FRAMES, N_FEATURES)
     # Torch 2.4+ defaults toward the dynamo exporter (needs onnxscript).
     # Legacy exporter is enough for this tiny FCN and matches openWakeWord.

@@ -32,6 +32,11 @@ wake:
   # Mute wake scoring after beep / after a turn (ms).
   beep_mute_ms: 600
   debounce_ms: 1200
+  # Keep each live wake's 2 s clip in <project>/inbox/<label>/ (confirmed,
+  # false_wake, unsure, near_miss, barge) for `wake-train review/accept`.
+  # auto = only when model is a wake-train project's .onnx | true | false | path
+  harvest: auto
+  harvest_max: 500     # newest clips kept per label
 
 vad:
   # Silero speech probability threshold.
