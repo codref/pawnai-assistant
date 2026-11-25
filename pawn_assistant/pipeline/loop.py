@@ -32,6 +32,7 @@ from pawn_assistant.audio.gain import InputGain
 from pawn_assistant.audio.debug_dump import DebugAudioDump
 from pawn_assistant.config import Settings
 from pawn_assistant.pipeline.asr import WhisperASR
+from pawn_assistant.pipeline.streaming_asr import StreamingSettings, ZipformerASR
 from pawn_assistant.pipeline.vad import SileroVAD
 from pawn_assistant.pipeline.wake import WakeDetector
 from pawn_assistant.wake_train.harvest import WakeHarvester, resolve_harvest_root
@@ -99,6 +100,15 @@ class WakeLoop:
             initial_prompt=settings.asr_initial_prompt,
             vad_filter=settings.asr_vad_filter,
         )
+        # Point 5 — streaming Zipformer (Whisper stays the fallback).
+        self.stream_asr: Optional[ZipformerASR] = None
+        if str(settings.asr_engine).lower() == "zipformer":
+            self.stream_asr = ZipformerASR(
+                StreamingSettings.from_mapping(settings.asr_streaming),
+                sample_rate=settings.sample_rate,
+            )
+        self._streaming = False  # a stream is live for the current utterance
+        self._stream_skip = 0  # frames still to drop (beep leakage) before feeding
         # Point 2 — command plugins + spoken replies.
         self.ctx = CommandContext(lang=settings.reply_language)
         self.ctx.ui.emit = self._emit_event
@@ -201,6 +211,7 @@ class WakeLoop:
                 "wake_model": self.settings.wake_model,
                 "wake_threshold": self.settings.wake_threshold,
                 "whisper_resident": self.asr.resident,
+                "asr_engine": "zipformer" if self.stream_asr else "whisper",
                 "llm_resident": self.llm_resident,
                 "tts_resident": self.tts_resident,
                 "overruns": self.capture.overruns,
@@ -415,6 +426,7 @@ class WakeLoop:
         self._vad_prob = 0.0
         self._wake_score = 0.0
         self.capture.stop_utt_record()  # discard any in-flight native buffer
+        self._stream_cancel()
         self.capture.drain()
         self.wake.reset()
         self.vad.reset()
@@ -519,6 +531,7 @@ class WakeLoop:
             self._speech_total_ms = 0.0
             self._heard_speech = False
             self._listen_since = time.monotonic()
+            self._stream_begin()
             return
 
         if self._state in (State.LISTEN, State.HOLD):
@@ -534,6 +547,7 @@ class WakeLoop:
                 # Still fill VAD meters, but never latch speech on the wake tail.
                 speech = False
             self._utterance.append(frame)
+            self._stream_feed(frame)
             utterance_ms = len(self._utterance) * frame_ms
 
             if speech:
@@ -598,7 +612,7 @@ class WakeLoop:
             can_end = (
                 self._heard_speech
                 and self._speech_total_ms >= self.settings.min_speech_ms
-                and self._silence_ms >= self.settings.silence_end_ms
+                and self._silence_ms >= self._silence_end_ms()
             )
             if can_end or utterance_ms >= self.settings.max_utterance_ms:
                 self._begin_transcribe()
@@ -644,6 +658,60 @@ class WakeLoop:
         harvest = self._harvest()
         if harvest is not None:
             harvest.on_barge(score)
+
+    # ------------------------------------------------------------ streaming ASR
+
+    def _stream_begin(self) -> None:
+        self._streaming = False
+        if self.stream_asr is None:
+            return
+        try:
+            self.stream_asr.begin()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("streaming ASR unavailable, using Whisper: %s", exc)
+            return
+        self._streaming = True
+        self._stream_skip = int(self.settings.head_trim_ms / self.settings.frame_ms)
+
+    def _stream_feed(self, frame: np.ndarray) -> None:
+        if not getattr(self, "_streaming", False) or self.stream_asr is None:
+            return
+        if self._stream_skip > 0:  # wake-beep leakage: never let it decode
+            self._stream_skip -= 1
+            return
+        try:
+            partial = self.stream_asr.feed(frame)
+        except Exception:  # noqa: BLE001
+            logger.exception("streaming ASR feed failed — Whisper for this turn")
+            self._stream_cancel()
+            return
+        if partial is not None:
+            self._emit_event({"type": "event", "name": "partial", "text": partial})
+
+    def _stream_cancel(self) -> None:
+        if getattr(self, "_streaming", False) and self.stream_asr is not None:
+            self.stream_asr.cancel()
+        self._streaming = False
+
+    def _silence_end_ms(self) -> float:
+        if getattr(self, "_streaming", False) and self.stream_asr is not None:
+            override = self.stream_asr.cfg.silence_end_ms
+            if override:
+                return float(override)
+        return float(self.settings.silence_end_ms)
+
+    def _transcribe(self, audio: np.ndarray, streamed: bool) -> tuple[Any, str]:
+        """Final transcript: the stream's result, else Whisper on the same audio."""
+        if streamed and self.stream_asr is not None:
+            try:
+                result = self.stream_asr.finish()
+            except Exception:  # noqa: BLE001
+                logger.exception("streaming ASR finish failed")
+                result = None
+            if result is not None and (result.text or not self.stream_asr.cfg.fallback_whisper):
+                return result, "zipformer"
+            logger.info("streaming result empty — Whisper fallback")
+        return self.asr.transcribe(audio, sample_rate=self.settings.sample_rate), "whisper"
 
     def _maybe_dump_near_miss(self) -> None:
         if self.debug is None:
@@ -704,6 +772,9 @@ class WakeLoop:
     def _prefetch_models(self) -> None:
         """Load LLM (+ prompt prefix) and voice while the user is still talking."""
         jobs = []
+        stream_asr = getattr(self, "stream_asr", None)
+        if stream_asr is not None and not stream_asr.resident:
+            jobs.append(stream_asr.load)
         if self.llm is not None and not self.llm.resident:
             jobs.append(self.llm.warmup)
         if self.tts is not None and not self.tts.resident:
@@ -721,13 +792,15 @@ class WakeLoop:
         threading.Thread(target=_run, name="pawn-prefetch", daemon=True).start()
 
     def _begin_transcribe(self) -> None:
+        streamed = bool(getattr(self, "_streaming", False))
+        self._streaming = False  # the worker owns the stream from here
         audio = self._utt_audio_16k()
         self._utterance = []
         self._silence_ms = 0.0
         self._set_state(State.BUSY)
 
         trim = int(
-            self.settings.sample_rate * (self.settings.silence_end_ms / 1000.0) * 0.5
+            self.settings.sample_rate * (self._silence_end_ms() / 1000.0) * 0.5
         )
         if trim > 0 and audio.size > trim:
             audio = audio[:-trim]
@@ -754,6 +827,8 @@ class WakeLoop:
         def _worker() -> None:
             try:
                 if audio.size < self.settings.sample_rate * 0.15:
+                    if streamed and self.stream_asr is not None:
+                        self.stream_asr.cancel()
                     self._emit_event(
                         {
                             "type": "event",
@@ -767,9 +842,7 @@ class WakeLoop:
                     )
                     self._harvest_resolve("false_wake", reason="too_short")
                 else:
-                    result = self.asr.transcribe(
-                        audio, sample_rate=self.settings.sample_rate
-                    )
+                    result, engine = self._transcribe(audio, streamed)
                     self._emit_event(
                         {
                             "type": "event",
@@ -778,6 +851,7 @@ class WakeLoop:
                             "duration_ms": round(result.duration_ms, 1),
                             "infer_ms": round(result.infer_ms, 1),
                             "rtf": round(result.rtf, 3),
+                            "engine": engine,
                         }
                     )
                     if result.text:

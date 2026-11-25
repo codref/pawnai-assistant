@@ -36,7 +36,7 @@ Desktop OS already uses ~1.5–2.5 GB. Keep the always-on loop under ~200 MB whe
 2. **Local command words** — fast-path phrases + small local LLM (grammar-forced intent JSON) → deterministic handlers (time, date, timers, cancel) → Piper reply. See [`02-commands.md`](02-commands.md).
 3. **Recorder phrases** — new intents → `POST /sessions/start|stop|flush|notes` on recorder serve.
 4. **Agent turns** — `unknown` utterances → `POST /v1/pawn/chat`; speak replies via `/v1/audio/speech`.
-5. **Later** — custom “hey pawn” polish, streaming Zipformer, barge-in / AEC.
+5. **Polish** — custom “hey pawn” (live clip harvest → review → retrain → calibrate), streaming Zipformer (`asr.engine: zipformer`, Whisper fallback), barge-in over PipeWire echo-cancel (`aec`, `barge_in`).
 
 ## Integration contracts (later points)
 
@@ -57,7 +57,7 @@ Desktop OS already uses ~1.5–2.5 GB. Keep the always-on loop under ~200 MB whe
 - pyannote / Nemotron diarization
 - NeMo Parakeet as the command ASR
 - Custom wake-word training (until after point 1)
-- Full echo cancellation (mute wake during beep/TTS first)
+- In-process echo cancellation (AEC is PipeWire's module-echo-cancel; without it the mic is ignored during beep/TTS)
 - Running `ollama@gemma4:4b` alongside diarize workers on 8 GB
 
 ## Identity

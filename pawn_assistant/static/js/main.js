@@ -103,7 +103,23 @@
     drawSpark();
   }
 
+  function dropPartial() {
+    const first = els.log.firstElementChild;
+    if (first && first.classList.contains("partial")) first.remove();
+  }
+
+  function showPartial(text) {
+    let li = els.log.firstElementChild;
+    if (!li || !li.classList.contains("partial")) {
+      li = document.createElement("li");
+      li.className = "partial";
+      els.log.prepend(li);
+    }
+    li.textContent = `${text} …`;
+  }
+
   function addTranscript(ev) {
+    dropPartial();
     const li = document.createElement("li");
     if (!ev.text) {
       li.className = "empty";
@@ -115,7 +131,7 @@
     }
     const meta = document.createElement("span");
     meta.className = "meta";
-    meta.textContent = `${ev.duration_ms} ms audio · ${ev.infer_ms} ms infer · rtf ${ev.rtf}`;
+    meta.textContent = `${ev.duration_ms} ms audio · ${ev.infer_ms} ms infer · rtf ${ev.rtf}${ev.engine ? " · " + ev.engine : ""}`;
     li.appendChild(meta);
     els.log.prepend(li);
     while (els.log.children.length > 40) els.log.removeChild(els.log.lastChild);
@@ -230,6 +246,8 @@
           appendToLatest("reply", `PAWN: ${ev.text}`);
         }
       }
+    } else if (ev.name === "partial") {
+      if (ev.text) showPartial(ev.text);
     } else if (ev.name === "barge_in") {
       appendToLatest("barge", `✂ cut off (wake ${ev.score})`);
     } else if (ev.name === "aec") {

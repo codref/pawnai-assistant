@@ -41,6 +41,10 @@ dev = [
 # Prefer the CPU wheel on this laptop (avoids multi‑GB CUDA deps):
 #   uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 #   uv sync --extra wake-train
+# Streaming command ASR (asr.engine: zipformer).
+streaming = [
+    "sherpa-onnx>=1.10.0",
+]
 wake-train = [
     "scipy>=1.10.0",
     "onnx>=1.15.0",

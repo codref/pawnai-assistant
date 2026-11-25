@@ -65,6 +65,10 @@ class Settings:
     )
     # Let faster-whisper's own Silero pass cut leading/trailing non-speech.
     asr_vad_filter: bool = True
+    # whisper (decode after the turn) | zipformer (sherpa-onnx, streaming).
+    asr_engine: str = "whisper"
+    # Raw ``asr.streaming`` section (see pipeline/streaming_asr.py).
+    asr_streaming: dict = field(default_factory=dict)
     # Input gain. ALSA hw devices: percent of the mixer ``gain_control`` range
     # (applied at startup when set). Other devices: software gain in dB.
     input_gain_percent: Optional[float] = None
@@ -221,6 +225,8 @@ def _flatten_yaml(data: Mapping[str, Any]) -> dict[str, Any]:
         ("asr", "idle_unload_s"): "whisper_idle_unload_s",
         ("asr", "initial_prompt"): "asr_initial_prompt",
         ("asr", "vad_filter"): "asr_vad_filter",
+        ("asr", "engine"): "asr_engine",
+        ("asr", "streaming"): "asr_streaming",
         ("beep", "freq_hz"): "beep_freq_hz",
         ("beep", "duration_ms"): "beep_duration_ms",
         ("beep", "volume"): "beep_volume",

@@ -74,6 +74,21 @@ asr:
     di cinque minuti, quanto manca al timer, annulla il timer.
   # faster-whisper's own speech filter: trims non-speech around the command.
   vad_filter: true
+  # whisper = decode after you stop | zipformer = sherpa-onnx streaming
+  # (partials on the HUD while you talk, final text right at end of speech).
+  engine: whisper
+  streaming:
+    # Folder of a sherpa-onnx *online transducer*: encoder*/decoder*/joiner*.onnx
+    # + tokens.txt (int8 preferred). No official Italian model exists; community
+    # Zipformer2 builds do (check the licence). uv sync --extra streaming
+    model_dir: ~/.local/share/pawn-assistant/zipformer-it
+    threads: 2
+    # Shorter end-of-speech wait: the transcript is already done.
+    silence_end_ms: 600
+    # Empty streaming result → Whisper decodes the same audio.
+    fallback_whisper: true
+    # hotwords_file: ./hotwords.txt   # one command phrase per line (beam search)
+    idle_unload_s: 300
 
 intent:
   # Fast-path phrase match first; the local LLM only runs on a miss.

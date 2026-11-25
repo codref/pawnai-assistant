@@ -149,6 +149,17 @@ pawn-assistant serve --device 0   # sounddevice index from list-devices
 - Window layer over the stage: commands open live windows (timer countdown, radio station card). Drag by the title bar, resize from the corner, minimize to the tray, `Esc` closes; positions are remembered per window kind. `M` opens the MODULES manager.
 - Reloading the tab reconnects the WebSocket; the mic and models stay in the Python process.
 
+## Streaming ASR (Zipformer)
+
+`asr.engine: zipformer` swaps Whisper for a sherpa-onnx streaming transducer: every 80 ms frame is decoded while you talk, the HUD log shows the partial text live, and the final transcript is ready at end of speech, so the turn ends after `asr.streaming.silence_end_ms` (600 ms) instead of 900. Whisper stays loaded on demand as the fallback for an empty streaming result (and when the model cannot load).
+
+```bash
+uv sync --extra streaming
+# point asr.streaming.model_dir at a model folder (encoder/decoder/joiner .onnx + tokens.txt)
+```
+
+There is no official Italian streaming model in sherpa-onnx; community Zipformer2 builds (e.g. Kroko) work if they ship the usual transducer files. English/French official models work as-is for testing.
+
 ## Echo cancellation and barge-in
 
 With `aec.enabled: true` PAWN loads PipeWire's `module-echo-cancel` (WebRTC) at startup: the wake loop records from `pawn_ec_source`, and beeps, Piper replies and the radio play into `pawn_ec_sink`, so PAWN hears the room minus itself. That enables **barge-in**: say the wake word while PAWN is talking and it stops mid-sentence, beeps and listens for the new command (also works on timer alerts and inside a conversation).
