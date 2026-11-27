@@ -499,7 +499,7 @@ class WakeLoop:
                 self._speak_since = None
                 self._wake_score = 0.0
             return
-        self._speak_since = None
+        self._end_barge_window()
 
         if self._state in (State.IDLE, State.STIR):
             if muted:
@@ -631,8 +631,11 @@ class WakeLoop:
             # wake word itself) — flush them before scoring.
             self._speak_since = now
             self._barge_hits = 0
+            self._barge_peak = 0.0
             self.wake.reset()
         score = self.wake.score(frame)
+        if now - self._speak_since >= self.settings.barge_in_arm_ms / 1000.0:
+            self._barge_peak = max(getattr(self, "_barge_peak", 0.0), score)
         armed = now - self._speak_since >= self.settings.barge_in_arm_ms / 1000.0
         self._wake_score = score if armed else 0.0
         if not armed:
@@ -643,6 +646,17 @@ class WakeLoop:
             self._barge_hits = 0
         if self._barge_hits >= max(1, int(self.settings.barge_in_frames)):
             self._on_barge_in(score)
+
+    def _end_barge_window(self) -> None:
+        """Reply over: log how close the room came to a barge-in (tuning aid)."""
+        if getattr(self, "_speak_since", None) is not None:
+            logger.info(
+                "reply window %.1f s: peak wake score %.3f (barge threshold %.2f)",
+                time.monotonic() - self._speak_since,
+                getattr(self, "_barge_peak", 0.0),
+                self.settings.barge_threshold,
+            )
+        self._speak_since = None
 
     def _on_barge_in(self, score: float) -> None:
         """Audio thread: cut PAWN off; the worker re-opens the mic when it unwinds."""
