@@ -228,6 +228,8 @@ def serve(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if settings.wake_auto_update:
+        _apply_server_wake_model(settings)
     from pawn_assistant.server.app import create_app
 
     application = create_app(settings)
@@ -260,6 +262,27 @@ def serve(
         port=settings.port,
         log_level=settings.log_level.lower(),
     )
+
+
+def _apply_server_wake_model(settings) -> None:
+    """``wake.auto_update``: run pawn-server's active wake model (and its thresholds)."""
+    from pawn_assistant.commands.base import default_state_dir
+    from pawn_assistant.server_api import DeviceClient, load_identity
+    from pawn_assistant.wake_train.sync import ensure_model
+
+    ident = load_identity((settings.commands or {}).get("device") or {})
+    if ident is None:
+        console.print("[dim]wake.auto_update: not registered (pawn-assistant device register)[/dim]")
+        return
+    got = ensure_model(DeviceClient(ident), default_state_dir() / "wake")
+    if got is None:
+        return
+    path, model = got
+    settings.wake_model = str(path)
+    levels = model.get("thresholds") or {}
+    if isinstance(levels.get("wake"), (int, float)):
+        settings.wake_threshold = float(levels["wake"])
+    console.print(f"[dim]wake model {model['version']} from pawn-server[/dim]")
 
 
 def _command_settings(config: Optional[str]):
@@ -1059,6 +1082,163 @@ def wake_test_cmd(
 
 
 # --------------------------------------------------------------- echo cancel
+
+def _admin(server: Optional[str], token: Optional[str], config: Optional[str]):
+    """Shared-token client: --server/--token, else commands.pawn.server_url/token."""
+    from pawn_assistant.server_api import AdminClient
+
+    pawn_cfg = (_command_settings(config).commands or {}).get("pawn") or {}
+    url = server or str(pawn_cfg.get("server_url") or "")
+    tok = token or str(pawn_cfg.get("token") or "")
+    if not url:
+        console.print("[red]✗[/] no pawn-server URL (--server or commands.pawn.server_url)")
+        raise typer.Exit(1)
+    return AdminClient(url, tok)
+
+
+def _device_client(config: Optional[str]):
+    from pawn_assistant.server_api import DeviceClient, load_identity
+
+    ident = load_identity((_command_settings(config).commands or {}).get("device") or {})
+    if ident is None:
+        console.print("[red]✗[/] not registered — run [cyan]pawn-assistant device register[/]")
+        raise typer.Exit(1)
+    return DeviceClient(ident)
+
+
+@wake_train_app.command("pull")
+def wake_pull_cmd(
+    project: str = typer.Option(..., "--project", "-p"),
+    label: Optional[list[str]] = typer.Option(None, "--label", "-l", help="Only these labels"),
+    server: Optional[str] = typer.Option(None, help="pawn-server URL (default commands.pawn.server_url)"),
+    token: Optional[str] = typer.Option(None, help="Shared API token (default commands.pawn.token)"),
+    config: Optional[str] = _CONFIG_OPT,
+) -> None:
+    """Download wake clips other assistants uploaded into this project's inbox."""
+    from pawn_assistant.server_api import ServerError
+    from pawn_assistant.wake_train.sync import pull_clips
+
+    try:
+        rep = pull_clips(_admin(server, token, config), Path(project), labels=label or None)
+    except ServerError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        raise typer.Exit(1) from exc
+    console.print(f"pulled {rep.added} · already had {rep.skipped} · failed {rep.failed}")
+    if rep.added:
+        console.print(f"next: pawn-assistant wake-train review -p {project}")
+
+
+@wake_train_app.command("push")
+def wake_push_cmd(
+    project: str = typer.Option(..., "--project", "-p"),
+    label: Optional[list[str]] = typer.Option(None, "--label", "-l"),
+    config: Optional[str] = _CONFIG_OPT,
+) -> None:
+    """Upload this laptop's harvested inbox clips to pawn-server."""
+    from pawn_assistant.wake_train.sync import push_clips
+
+    rep = push_clips(_device_client(config), Path(project), labels=label or None)
+    console.print(f"uploaded {rep.added} · skipped {rep.skipped} · failed {rep.failed}")
+
+
+@wake_train_app.command("publish")
+def wake_publish_cmd(
+    model: str = typer.Option(..., "--model", "-m", help="Trained .onnx"),
+    notes: str = typer.Option("", help="What changed in this model"),
+    version: str = typer.Option("", help="Version label (default: timestamp)"),
+    wake_threshold: Optional[float] = typer.Option(None, help="Suggested wake.threshold (from calibrate)"),
+    barge_threshold: Optional[float] = typer.Option(None, help="Suggested barge_in.threshold"),
+    server: Optional[str] = typer.Option(None),
+    token: Optional[str] = typer.Option(None),
+    config: Optional[str] = _CONFIG_OPT,
+) -> None:
+    """Make a trained model pawn-server's active wake model (every assistant downloads it)."""
+    from pawn_assistant.server_api import ServerError
+    from pawn_assistant.wake_train.sync import publish_model
+
+    levels = {k: v for k, v in (("wake", wake_threshold), ("barge_in", barge_threshold)) if v is not None}
+    try:
+        info = publish_model(_admin(server, token, config), Path(model), notes=notes, version=version, thresholds=levels)
+    except ServerError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        raise typer.Exit(1) from exc
+    console.print(f"[bold green]published[/] {info['version']} sha {info['sha256'][:12]}")
+
+
+device_app = typer.Typer(name="device", help="Register this laptop with pawn-server.", no_args_is_help=True)
+app.add_typer(device_app, name="device")
+
+
+@device_app.command("register")
+def device_register(
+    name: str = typer.Option("laptop", help="Name shown in the portal and to the agent"),
+    server: Optional[str] = typer.Option(None, help="pawn-server URL (default commands.pawn.server_url)"),
+    token: Optional[str] = typer.Option(None, help="Shared API token, used once (default commands.pawn.token)"),
+    device_id: Optional[str] = typer.Option(None, "--device-id", help="Already registered in the portal: its id"),
+    device_token: Optional[str] = typer.Option(None, "--device-token", help="…and the token the portal showed"),
+    config: Optional[str] = _CONFIG_OPT,
+) -> None:
+    """Register (or store a portal registration) and write device.json."""
+    from pawn_assistant.server_api import (
+        DESKTOP_CAPABILITIES,
+        DeviceClient,
+        DeviceIdentity,
+        ServerError,
+        register_device,
+    )
+
+    pawn_cfg = (_command_settings(config).commands or {}).get("pawn") or {}
+    url = (server or str(pawn_cfg.get("server_url") or "")).rstrip("/")
+    if not url:
+        console.print("[red]✗[/] no pawn-server URL (--server or commands.pawn.server_url)")
+        raise typer.Exit(1)
+    try:
+        if device_id and device_token:
+            ident = DeviceIdentity(url, device_id, device_token, name)
+            DeviceClient(ident).update(capabilities=list(DESKTOP_CAPABILITIES))
+        else:
+            ident = register_device(url, token or str(pawn_cfg.get("token") or ""), name)
+    except ServerError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        raise typer.Exit(1) from exc
+    path = ident.save()
+    console.print(f"[bold green]registered[/] {ident.name} ({ident.device_id}) → {path}")
+    console.print("[dim]restart `pawn-assistant serve` to open the command stream[/dim]")
+
+
+@device_app.command("status")
+def device_status(config: Optional[str] = _CONFIG_OPT) -> None:
+    """Show this laptop's registration as pawn-server sees it."""
+    from pawn_assistant.server_api import ServerError
+
+    client = _device_client(config)
+    try:
+        info = client.info()
+    except ServerError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        raise typer.Exit(1) from exc
+    table = Table("field", "value")
+    for key in ("name", "kind", "device_id", "capabilities", "presence", "last_seen"):
+        table.add_row(key, str(info.get(key)))
+    console.print(table)
+
+
+@device_app.command("forget")
+def device_forget(
+    config: Optional[str] = _CONFIG_OPT,
+    local_only: bool = typer.Option(False, help="Only delete device.json, keep the server entry"),
+) -> None:
+    """Revoke this laptop on pawn-server and delete device.json."""
+    from pawn_assistant.server_api import ServerError, identity_path
+
+    if not local_only:
+        try:
+            _device_client(config).forget()
+        except ServerError as exc:
+            console.print(f"[yellow]server:[/] {exc}")
+    identity_path().unlink(missing_ok=True)
+    console.print("forgotten")
+
 
 aec_app = typer.Typer(
     name="aec", help="Echo cancellation (PipeWire) for barge-in.", no_args_is_help=True

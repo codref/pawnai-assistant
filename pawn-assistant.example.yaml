@@ -37,6 +37,9 @@ wake:
   # auto = only when model is a wake-train project's .onnx | true | false | path
   harvest: auto
   harvest_max: 500     # newest clips kept per label
+  # Run pawn-server's active wake model (published with `wake-train publish`)
+  # and its suggested threshold. Needs `pawn-assistant device register`.
+  auto_update: false
 
 vad:
   # Silero speech probability threshold.
@@ -172,6 +175,22 @@ commands:
     timeout_s: 90          # per agent turn
     followup_timeout_s: 8  # silence after a reply that ends the conversation
     thinking_cue_s: 4      # soft blip if pawn is still thinking
+    # Once registered (`pawn-assistant device register`), turns carry this
+    # laptop's device id: "continua qui" takes over the phone's conversation
+    # and "sblocca col telefono" asks the phone for a fingerprint instead of
+    # the keypad. Set false to keep the voice turns anonymous.
+    link_device: true
+  device:
+    # Link to pawn-server as a registered assistant: runs speak / notify /
+    # timer_set commands the agent sends, and reports presence so the agent
+    # speaks where you are. Identity comes from
+    # ~/.local/state/pawn-assistant/device.json (`device register`); these
+    # keys override it.
+    # server_url: http://192.168.1.61:8000
+    # device_id: ""
+    # device_token: ""
+    idle_after_s: 300   # no wake for this long → presence "idle"
+    heartbeat_s: 120
 
 aec:
   # Echo cancellation via PipeWire module-echo-cancel (WebRTC). PAWN records

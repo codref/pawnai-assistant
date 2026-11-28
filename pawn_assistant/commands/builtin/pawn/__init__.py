@@ -8,6 +8,14 @@ and the loop keeps listening after each reply (no wake word) until silence or
 Access starts as ``chat`` (no tools). "Sblocca le sessioni" opens a keypad;
 the right code (``commands.pawn.unlock_code``) switches the conversation to
 ``full`` until it ends, the user says "blocca", or ``unlock_max_minutes``.
+"Sblocca col telefono" asks the phone instead: pawn-server sends it an
+``access_approve`` command, the user confirms with a fingerprint, and the
+conversation is ``full`` for the granted minutes.
+
+"Continua qui" takes over the conversation the phone (or another assistant)
+was having in the last few minutes (pawn-server ``/v1/pawn/voice/active`` +
+``claim``). Turns carry this laptop's ``device_id`` once it is registered
+(``pawn-assistant device register``). See pawnai docs/VOICE_PROTOCOL.md.
 """
 
 from __future__ import annotations
@@ -59,6 +67,11 @@ _END_SHORT_RE = re.compile(
     r"|arrivederci|a dopo|bye|goodbye|shut up|quiet)\b"
 )
 _UNLOCK_RE = re.compile(r"\b(?:sblocca\w*|unlock\w*)\b")
+_PHONE_RE = re.compile(r"\b(?:telefon\w*|cellulare|smartphone|phone)\b")
+_RESUME_RE = re.compile(
+    r"\b(?:continu\w*|riprend\w*|prosegu\w*)\s+(?:qui|qua|da qui|la conversazione|la chiacchierata|il discorso)\b"
+    r"|\b(?:continue|resume|pick up)\s+(?:here|the conversation|where we left off)\b"
+)
 # "\bbloc" never matches inside "sblocca" (no word boundary after the s).
 _LOCK_RE = re.compile(
     r"\b(?:(?:ri)?bloc\w*|richiud\w*|revoc\w*|togli\w*|disattiv\w*|lock\w*|revoke|disable)\b"
@@ -81,6 +94,8 @@ class VoiceBackend(Protocol):
     ) -> VoiceAnswer: ...
 
 
+ACCESS_POLL_S = 1.0
+
 class PawnCommand(Command):
     name = "pawn"
     title = "Pawn agent"
@@ -101,6 +116,11 @@ class PawnCommand(Command):
         self.failures = 0
         self.lockout_until = 0.0
         self.turns: list[dict[str, str]] = []
+        # Registered device id (pawn-server); None until `device register`.
+        self.device_id: Optional[str] = None
+        self.access_request: Optional[str] = None  # pending phone approval id
+        self.sleep: Callable[[float], None] = time.sleep
+        self.spawn: Callable[[Callable[[], None]], None] = _spawn
 
     # ------------------------------------------------------------------ config
 
@@ -111,6 +131,18 @@ class PawnCommand(Command):
             token=str(self.config.get("token") or ""),
             timeout_s=float(self.config.get("timeout_s") or 90.0),
         )
+
+    def setup(self, ctx: CommandContext) -> None:
+        self.device_id = str(self.config.get("device_id") or "") or None
+        if self.device_id is None and self.config.get("link_device", True):
+            try:
+                from pawn_assistant.server_api import load_identity
+
+                ident = load_identity()
+            except Exception:  # noqa: BLE001
+                ident = None
+            if ident is not None and ident.server_url.rstrip("/") == self.client.server_url:
+                self.device_id = ident.device_id
 
     @property
     def unlock_code(self) -> str:
@@ -146,10 +178,14 @@ class PawnCommand(Command):
                 len(norm.split()) <= 4 and _END_SHORT_RE.search(norm)
             ):
                 return FastMatch("pawn.end", {}, 1.0)
+        if _UNLOCK_RE.search(norm) and _PHONE_RE.search(norm):
+            return FastMatch("pawn.unlock_phone", {}, 1.0)
         if _UNLOCK_RE.search(norm) and (
             self.in_conversation or re.search(r"session|pawn|accesso|access", norm)
         ):
             return FastMatch("pawn.unlock", {}, 1.0)
+        if _RESUME_RE.search(norm):
+            return FastMatch("pawn.resume", {}, 1.0)
         if not self.in_conversation and _START_RE.search(norm):
             return FastMatch("pawn.start", {}, 1.0)
         return None
@@ -175,8 +211,12 @@ class PawnCommand(Command):
     def start(self, slots: dict[str, Any], ctx: CommandContext) -> str:
         if not self.client.configured:
             return ctx.t("Il server di pawn non è configurato.", "The pawn server is not configured.")
+        self._open(ctx, f"voice:{uuid.uuid4().hex[:12]}")
+        return ctx.t("Dimmi.", "I'm listening.")
+
+    def _open(self, ctx: CommandContext, conversation: str) -> None:
         with self._lock:
-            self.conversation = f"voice:{uuid.uuid4().hex[:12]}"
+            self.conversation = conversation
             self._relock()
             self.turns = []
             ctx.floor = self.name
@@ -190,7 +230,108 @@ class PawnCommand(Command):
             data=self._chat_data(status=ctx.t("in ascolto", "listening")),
             anchor="tr",
         )
-        return ctx.t("Dimmi.", "I'm listening.")
+
+    @intent(
+        "pawn.resume",
+        "the user wants to continue here the conversation started on another device",
+        examples=("continua qui", "riprendi la conversazione", "continue here"),
+        phrase=False,
+    )
+    def resume(self, slots: dict[str, Any], ctx: CommandContext) -> str:
+        if not self.client.configured:
+            return ctx.t("Il server di pawn non è configurato.", "The pawn server is not configured.")
+        try:
+            thread = self.client.active_thread(exclude_device=self.device_id)
+        except PawnError as exc:
+            logger.warning("pawn resume: %s", exc)
+            return ctx.t("Pawn non risponde.", "Pawn is not answering.")
+        if not thread:
+            return ctx.t("Non c'è una conversazione da riprendere.", "There's no conversation to pick up.")
+        conversation = str(thread["conversation"])
+        origin = thread.get("device_name")
+        if self.device_id:
+            try:
+                claimed = self.client.claim(conversation, self.device_id)
+                origin = claimed.get("from_device") or origin
+            except PawnError as exc:
+                logger.warning("pawn resume: claim failed: %s", exc)
+                return ctx.t("Non riesco a riprendere quella conversazione.", "I can't pick that conversation up.")
+        self._open(ctx, conversation)
+        last = _first_sentence(str(thread.get("last_answer") or ""))
+        if last:
+            self.turns = [{"who": "pawn", "text": str(thread.get("last_answer"))}]
+            self._push_chat(ctx, status=ctx.t("in ascolto", "listening"))
+        where = f" da {origin}" if origin and ctx.lang == "it" else (f" from {origin}" if origin else "")
+        head = ctx.t(f"Riprendo{where}.", f"Picking up{where}.")
+        return f"{head} {ctx.t('Ero rimasto a:', 'Last thing I said:')} {last}" if last else head
+
+    @intent(
+        "pawn.unlock_phone",
+        "the user wants to unlock full access by confirming on the phone",
+        examples=("sblocca col telefono", "unlock with the phone"),
+        phrase=False,
+    )
+    def unlock_phone(self, slots: dict[str, Any], ctx: CommandContext) -> str:
+        if not self.client.configured:
+            return ctx.t("Il server di pawn non è configurato.", "The pawn server is not configured.")
+        if not self.device_id:
+            return ctx.t(
+                "Questo computer non è registrato con pawn.", "This computer isn't registered with pawn."
+            )
+        if not self.in_conversation:
+            self.start({}, ctx)
+        if self._is_unlocked():
+            return ctx.t("È già sbloccato.", "It's already unlocked.")
+        if self.access_request:
+            return ctx.t("Sto già aspettando il telefono.", "Already waiting for the phone.")
+        minutes = max(1, int(self.unlock_max_s // 60))
+        try:
+            req = self.client.request_access(
+                self.device_id, conversation=self.conversation, minutes=minutes
+            )
+        except PawnError as exc:
+            logger.warning("pawn unlock_phone: %s", exc)
+            if exc.status == 409:
+                return ctx.t("Nessun telefono può confermare.", "No phone can confirm.")
+            return ctx.t("Pawn non risponde.", "Pawn is not answering.")
+        self.access_request = str(req["id"])
+        conversation = self.conversation
+        self._push_chat(ctx, status=ctx.t("conferma sul telefono…", "confirm on the phone…"))
+        self.spawn(lambda: self.wait_access(ctx, self.access_request or "", conversation))
+        return ctx.t("Conferma sul telefono.", "Confirm on your phone.")
+
+    def wait_access(self, ctx: CommandContext, request_id: str, conversation: Optional[str]) -> str:
+        """Poll the approval until it is final; announce the outcome. Returns the status."""
+        status = "pending"
+        deadline = self.clock() + 120.0
+        req: dict[str, Any] = {}
+        while status == "pending" and self.clock() < deadline:
+            self.sleep(ACCESS_POLL_S)
+            try:
+                req = self.client.access_status(request_id)
+            except PawnError as exc:
+                logger.debug("pawn access status: %s", exc)
+                continue
+            status = str(req.get("status") or "pending")
+        with self._lock:
+            if self.access_request == request_id:
+                self.access_request = None
+            if self.conversation != conversation or conversation is None:
+                return status  # the conversation ended meanwhile: grant nothing
+            if status == "approved":
+                minutes = float(req.get("minutes") or self.unlock_max_s / 60)
+                self.access = "full"
+                self.unlocked_until = self.clock() + min(minutes * 60.0, self.unlock_max_s)
+                self.failures = 0
+                text = ctx.t("Accesso completo.", "Full access unlocked.")
+            elif status == "denied":
+                text = ctx.t("Il telefono ha rifiutato.", "The phone declined.")
+            else:
+                text = ctx.t("Il telefono non ha risposto.", "The phone didn't answer.")
+        logger.info("pawn phone unlock %s: %s", request_id, status)
+        self._push_chat(ctx)
+        ctx.announce(text, intent="pawn.unlock", beeps=0, command=self.name)
+        return status
 
     @intent(
         "pawn.end",
@@ -262,12 +403,14 @@ class PawnCommand(Command):
         cue.start()
         controls: list[str] = []
         try:
+            extra: dict[str, Any] = {"device_id": self.device_id} if self.device_id else {}
             answer = self.client.voice(
                 conversation,
                 text,
                 access=access,
                 lang=ctx.lang,
                 on_progress=lambda line: ctx.ui.update(CHAT_WIDGET, {"status": line}),
+                **extra,
             )
             reply = answer.text.strip() or ctx.t("Non ho una risposta.", "I have no answer.")
             controls = list(answer.controls)
@@ -290,8 +433,9 @@ class PawnCommand(Command):
         return reply
 
     def on_floor_timeout(self, ctx: CommandContext) -> None:
-        if ctx.ui.is_open(KEYPAD_WIDGET):
-            # Typing the code: keep the floor, the unlock announcement re-opens the mic.
+        if ctx.ui.is_open(KEYPAD_WIDGET) or self.access_request:
+            # Typing the code / confirming on the phone: keep the floor; the
+            # unlock announcement re-opens the mic.
             self._push_chat(ctx, status=ctx.t("in pausa", "paused"))
             return
         if self.in_conversation:
@@ -384,6 +528,7 @@ class PawnCommand(Command):
     def _end(self, ctx: CommandContext) -> None:
         with self._lock:
             self.conversation = None
+            self.access_request = None
             self._relock()
             self.turns = []
             if ctx.floor == self.name:
@@ -409,6 +554,18 @@ class PawnCommand(Command):
 
     def _push_chat(self, ctx: CommandContext, status: str = "") -> None:
         ctx.ui.update(CHAT_WIDGET, self._chat_data(status))
+
+
+def _first_sentence(text: str, limit: int = 160) -> str:
+    text = " ".join(text.split())
+    match = re.match(r"(.+?[.!?])(?:\s|$)", text)
+    out = match.group(1) if match else text
+    return out if len(out) <= limit else out[: limit - 1].rstrip() + "…"
+
+
+def _spawn(fn: Callable[[], None]) -> None:
+    thread = threading.Thread(target=fn, name="pawn-access-wait", daemon=True)
+    thread.start()
 
 
 def _thinking_cue() -> None:

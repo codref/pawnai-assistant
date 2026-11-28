@@ -195,6 +195,11 @@ class TimerCommand(Command):
         if seconds > MAX_TIMER_S:
             return ctx.t("Il massimo è ventiquattro ore.", "The maximum is twenty-four hours.")
         label = format_duration(seconds, ctx.lang)
+        self.start_timer(seconds, label, ctx)
+        return ctx.t(f"Timer di {label} avviato.", f"Timer for {label} started.")
+
+    def start_timer(self, seconds: int, label: str, ctx: CommandContext) -> int:
+        """Start a countdown with its widget (voice intent and pawn-server ``timer_set``)."""
         tid = self.timers.start(seconds, label)
         self.mark_active()
         now_ms = time.time() * 1000.0
@@ -212,7 +217,7 @@ class TimerCommand(Command):
                 "state": "running",
             },
         )
-        return ctx.t(f"Timer di {label} avviato.", f"Timer for {label} started.")
+        return tid
 
     # -- lifecycle ---------------------------------------------------------
 

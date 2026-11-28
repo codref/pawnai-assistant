@@ -2,7 +2,7 @@
 
 Always-listening wake loop for the PawnAI family: detect a stock wake phrase, beep, capture an utterance with Silero VAD, transcribe with faster-whisper `tiny` (int8), and show a cyberpunk HUD.
 
-Point 2 adds local **command words**: the transcript goes through a fast phrase matcher, then (on a miss) a small in-process LLM (Qwen2.5-1.5B, llama.cpp) that outputs grammar-forced intent JSON; Python handlers answer and a local Piper voice speaks. Recorder session control and pawn-server chat come later — see [`draft/plan.md`](draft/plan.md), [`draft/01-wake-ui.md`](draft/01-wake-ui.md), [`draft/02-commands.md`](draft/02-commands.md).
+Point 2 adds local **command words**: the transcript goes through a fast phrase matcher, then (on a miss) a small in-process LLM (Qwen2.5-1.5B, llama.cpp) that outputs grammar-forced intent JSON; Python handlers answer and a local Piper voice speaks. "Parliamo" opens a spoken conversation with the pawn agent on pawn-server (see [pawn-server](#pawn-server) below). Recorder session control comes later — see [`draft/plan.md`](draft/plan.md), [`draft/01-wake-ui.md`](draft/01-wake-ui.md), [`draft/02-commands.md`](draft/02-commands.md).
 
 ## Requirements
 
@@ -186,7 +186,46 @@ mic → openWakeWord → beep → Silero VAD → faster-whisper int8
 
 WebSocket: `ws://127.0.0.1:8787/ws` — see `draft/01-wake-ui.md`.
 
+## pawn-server
+
+Set `commands.pawn.server_url` and `token`. "Parliamo" opens a conversation over `POST /v1/pawn/voice`; "sblocca le sessioni" opens the keypad for full agent access. The protocol is pawnai's `docs/VOICE_PROTOCOL.md`; its golden transcripts and the shared utterances live in [`tests/contracts/`](tests/contracts) (copied by pawnai's `scripts/sync-contracts.sh` — never edit them here), and `tests/test_contract.py` replays them.
+
+### Register the laptop
+
+```bash
+pawn-assistant device register --name laptop     # uses commands.pawn.server_url + token once
+pawn-assistant device status
+pawn-assistant device forget                     # revoke + delete device.json
+```
+
+Or register it from the portal (**Assistants → Register → Laptop**) and paste the snippet it shows (`--device-id … --device-token …`). The identity is stored in `~/.local/state/pawn-assistant/device.json` (0600). Once registered, `serve`:
+
+- keeps `GET /v1/devices/{id}/commands/stream` open and runs what the agent sends: **speak** (a spoken alert), **notify** (a HUD window and speech) and **timer_set** (a normal countdown). The agent's `assistant_speak` / `assistant_timer` tools pick the assistant you were last near;
+- reports presence (`active` on each wake, `idle` after `commands.device.idle_after_s`, `away` on exit).
+
+### Hand-off and phone unlock
+
+- **"Continua qui"** / "riprendi la conversazione" takes over the conversation you were having on the phone (or another assistant) in the last 10 minutes. Access always restarts locked.
+- **"Sblocca col telefono"** asks the phone for full access: it shows "Allow laptop full access for N min?" and needs your fingerprint. The keypad still works.
+
+The Android app does the same in the other direction.
+
+### Wake word sync
+
+Every assistant can upload the clips that triggered its wakes. On this laptop:
+
+```bash
+pawn-assistant wake-train pull -p wakewords/hey_pawn       # phone clips → inbox/<label>/ (source: server)
+pawn-assistant wake-train push -p wakewords/hey_pawn       # this laptop's harvested clips → server
+pawn-assistant wake-train review -p wakewords/hey_pawn     # as usual
+pawn-assistant wake-train accept -p wakewords/hey_pawn
+pawn-assistant wake-train train -p wakewords/hey_pawn --out wakewords/hey_pawn/hey_pawn.v3.onnx
+pawn-assistant wake-train calibrate -p wakewords/hey_pawn --model wakewords/hey_pawn/hey_pawn.v3.onnx
+pawn-assistant wake-train publish -m wakewords/hey_pawn/hey_pawn.v3.onnx --notes "phone clips" --wake-threshold 0.55
+```
+
+With `wake.auto_update: true`, `serve` downloads the active model into `~/.local/state/pawn-assistant/wake/` when its checksum changes and uses its suggested threshold. The phone does the same.
+
 ## Out of scope (point 2)
 
 - `pawnai-recorder` `/sessions/*`
-- pawn-server chat (open-ended questions land on `unknown`)

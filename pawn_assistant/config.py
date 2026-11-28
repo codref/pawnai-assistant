@@ -53,6 +53,8 @@ class Settings:
     # auto = when wake_model lives in a project | true | false | project path.
     wake_harvest: Any = "auto"
     wake_harvest_max: int = 500
+    # Download pawn-server's active wake model at start (needs `device register`).
+    wake_auto_update: bool = False
     whisper_model: str = "small"
     whisper_compute_type: str = "int8"
     whisper_idle_unload_s: float = 60.0
@@ -210,6 +212,7 @@ def _flatten_yaml(data: Mapping[str, Any]) -> dict[str, Any]:
         ("wake", "debounce_ms"): "wake_debounce_ms",
         ("wake", "harvest"): "wake_harvest",
         ("wake", "harvest_max"): "wake_harvest_max",
+        ("wake", "auto_update"): "wake_auto_update",
         ("vad", "threshold"): "vad_threshold",
         ("vad", "energy_speech_db"): "energy_speech_db",
         ("vad", "silence_end_ms"): "silence_end_ms",
